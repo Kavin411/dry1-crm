@@ -6,9 +6,6 @@ import socket
 import random
 import urllib.parse
 import webbrowser
-from datetime import datetime
-from PIL import Image, ImageDraw
-from cryptography.fernet import Fernet
 
 # Page Configuration
 st.set_page_config(
@@ -18,39 +15,17 @@ st.set_page_config(
     initial_sidebar_state="auto"
 )
 
-# --- ENCRYPTION SETUP ---
-KEY_FILE = "secret.key"
-
-@st.cache_resource
-def get_cached_cipher():
-    if not os.path.exists(KEY_FILE):
-        key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as kf: 
-            kf.write(key)
-    else:
-        with open(KEY_FILE, "rb") as kf: 
-            key = kf.read()
-    return Fernet(key)
-
-cipher = get_cached_cipher()
-
-def load_encrypted_csv(filepath, dtype=None):
+# --- SIMPLE FILE STORAGE SETUP ---
+def load_data_csv(filepath, dtype=None):
     if not os.path.exists(filepath): 
         return pd.DataFrame()
     try:
-        with open(filepath, "rb") as f: 
-            data = f.read()
-        if not data: 
-            return pd.DataFrame()
-        return pd.read_csv(io.BytesIO(cipher.decrypt(data)), dtype=dtype)
+        return pd.read_csv(filepath, dtype=dtype)
     except Exception: 
         return pd.DataFrame()
 
-def save_encrypted_csv(df, filepath):
-    buf = io.BytesIO()
-    df.to_csv(buf, index=False)
-    with open(filepath, "wb") as f: 
-        f.write(cipher.encrypt(buf.getvalue()))
+def save_data_csv(df, filepath):
+    df.to_csv(filepath, index=False)
 
 # --- DATA FILE PATHS ---
 CUSTOMERS_FILE = "customers.csv"
@@ -61,19 +36,19 @@ SESSIONS_FILE = "active_sessions.csv"
 
 def init_db():
     if not os.path.exists(CUSTOMERS_FILE):
-        save_encrypted_csv(pd.DataFrame(columns=["Mobile", "Name", "Type", "Total Orders", "Total Spent", "Notes"]), CUSTOMERS_FILE)
+        save_data_csv(pd.DataFrame(columns=["Mobile", "Name", "Type", "Total Orders", "Total Spent", "Notes"]), CUSTOMERS_FILE)
     if not os.path.exists(ORDERS_FILE):
-        save_encrypted_csv(pd.DataFrame(columns=[
+        save_data_csv(pd.DataFrame(columns=[
             "Order ID", "Customer Name", "Mobile", "Customer Type", "Service", "Items Count", "Weight (KG)", 
             "Total Amount", "Paid Amount", "Balance Amount", "Payment Status", 
             "Order Status", "Promised Date", "Created Date", "Month-Year", "Special Instructions", "Assigned Delivery"
         ]), ORDERS_FILE)
     if not os.path.exists(EXPENSES_FILE):
-        save_encrypted_csv(pd.DataFrame(columns=["Date", "Expense Category", "Description", "Amount"]), EXPENSES_FILE)
+        save_data_csv(pd.DataFrame(columns=["Date", "Expense Category", "Description", "Amount"]), EXPENSES_FILE)
     if not os.path.exists(LEADS_FILE):
-        save_encrypted_csv(pd.DataFrame(columns=["Lead ID", "Customer Name", "Mobile", "Followup Date", "Status", "Notes"]), LEADS_FILE)
+        save_data_csv(pd.DataFrame(columns=["Lead ID", "Customer Name", "Mobile", "Followup Date", "Status", "Notes"]), LEADS_FILE)
     if not os.path.exists(SESSIONS_FILE):
-        save_encrypted_csv(pd.DataFrame(columns=["Session ID", "Device Name", "IP Address", "Role", "Login Time", "Status"]), SESSIONS_FILE)
+        save_data_csv(pd.DataFrame(columns=["Session ID", "Device Name", "IP Address", "Role", "Login Time", "Status"]), SESSIONS_FILE)
 
 init_db()
 
@@ -214,7 +189,7 @@ st.markdown(STYLING, unsafe_allow_html=True)
 
 # --- REAL-TIME SESSION LOGOUT CHECK ---
 if st.session_state.logged_in and st.session_state.session_id:
-    sessions_df = load_encrypted_csv(SESSIONS_FILE)
+    sessions_df = load_data_csv(SESSIONS_FILE)
     if not sessions_df.empty:
         my_session = sessions_df[sessions_df["Session ID"] == st.session_state.session_id]
         if not my_session.empty and my_session.iloc[0]["Status"] == "Logged Out":
@@ -273,12 +248,12 @@ if not st.session_state.logged_in:
                             st.session_state.logged_in = True
                             st.session_state.user_role = role
                             
-                            sessions_df = load_encrypted_csv(SESSIONS_FILE)
+                            sessions_df = load_data_csv(SESSIONS_FILE)
                             new_sess = pd.DataFrame([{
                                 "Session ID": sess_id, "Device Name": dev_name, "IP Address": dev_ip,
                                 "Role": role, "Login Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Status": "Active"
                             }])
-                            save_encrypted_csv(pd.concat([sessions_df, new_sess], ignore_index=True), SESSIONS_FILE)
+                            save_data_csv(pd.concat([sessions_df, new_sess], ignore_index=True), SESSIONS_FILE)
                             st.rerun()
                     else:
                         st.error("❌ Invalid Username or Password")
@@ -301,12 +276,12 @@ if not st.session_state.logged_in:
                             st.session_state.user_role = "👑 Admin"
                             st.session_state.otp_sent = False
                             
-                            sessions_df = load_encrypted_csv(SESSIONS_FILE)
+                            sessions_df = load_data_csv(SESSIONS_FILE)
                             new_sess = pd.DataFrame([{
                                 "Session ID": sess_id, "Device Name": dev_name, "IP Address": dev_ip,
                                 "Role": "👑 Admin", "Login Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Status": "Active"
                             }])
-                            save_encrypted_csv(pd.concat([sessions_df, new_sess], ignore_index=True), SESSIONS_FILE)
+                            save_data_csv(pd.concat([sessions_df, new_sess], ignore_index=True), SESSIONS_FILE)
                             st.rerun()
                         else:
                             st.error("❌ Invalid OTP Code")
@@ -327,11 +302,11 @@ st.sidebar.markdown(f"""
 """, unsafe_allow_html=True)
 
 user_role = st.session_state.user_role
-orders_df = load_encrypted_csv(ORDERS_FILE, dtype={"Mobile": str})
-customers_df = load_encrypted_csv(CUSTOMERS_FILE, dtype={"Mobile": str})
-expenses_df = load_encrypted_csv(EXPENSES_FILE)
-leads_df = load_encrypted_csv(LEADS_FILE, dtype={"Mobile": str})
-sessions_df = load_encrypted_csv(SESSIONS_FILE)
+orders_df = load_data_csv(ORDERS_FILE, dtype={"Mobile": str})
+customers_df = load_data_csv(CUSTOMERS_FILE, dtype={"Mobile": str})
+expenses_df = load_data_csv(EXPENSES_FILE)
+leads_df = load_data_csv(LEADS_FILE, dtype={"Mobile": str})
+sessions_df = load_data_csv(SESSIONS_FILE)
 
 # --- ROLE-BASED NAVIGATION MENU ---
 menu_options = []
@@ -365,12 +340,12 @@ nav_selection = st.sidebar.radio("", menu_options, label_visibility="collapsed")
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
 if st.sidebar.button("🚪 Logout Session"):
     if st.session_state.session_id:
-        sessions_df = load_encrypted_csv(SESSIONS_FILE)
+        sessions_df = load_data_csv(SESSIONS_FILE)
         if not sessions_df.empty:
             idx_list = sessions_df[sessions_df["Session ID"] == st.session_state.session_id].index
             if len(idx_list) > 0:
                 sessions_df.at[idx_list[0], "Status"] = "Logged Out"
-                save_encrypted_csv(sessions_df, SESSIONS_FILE)
+                save_data_csv(sessions_df, SESSIONS_FILE)
     st.session_state.logged_in = False
     st.session_state.session_id = None
     st.session_state.otp_sent = False
@@ -405,10 +380,8 @@ if user_role in ["👑 Admin", "👩‍💼 Reception", "🛵 Delivery Boy"] and
 if nav_selection == "🛵 Delivery Portal":
     st.subheader("🛵 Delivery Portal — Assigned Pickups & Direct Mobile Billing")
     
-    # --- TAB SWITCH FOR DELIVERY BOY ---
     d_tab1, d_tab2 = st.tabs(["📝 New Doorstep Pickup Billing", "📦 Active Delivery Orders"])
     
-    # TAB 1: DELIVERY BOY MOBILE BILLING FORM
     with d_tab1:
         st.markdown("##### 📝 Create Doorstep Pickup Order")
         with st.form("delivery_pickup_form"):
@@ -438,7 +411,6 @@ if nav_selection == "🛵 Delivery Portal":
                     new_id = f"DRY1-2026-{len(orders_df)+1:06d}"
                     curr_month_yr = today.strftime("%B %Y")
                     
-                    # Save Customer Profile
                     existing_cust = customers_df[customers_df["Mobile"] == str(dmobile)] if not customers_df.empty else pd.DataFrame()
                     if existing_cust.empty:
                         new_cust = pd.DataFrame([{
@@ -452,9 +424,8 @@ if nav_selection == "🛵 Delivery Portal":
                         customers_df.at[c_idx, "Type"] = "Delivery"
                         customers_df.at[c_idx, "Total Orders"] = int(customers_df.at[c_idx, "Total Orders"]) + 1
                         customers_df.at[c_idx, "Total Spent"] = float(customers_df.at[c_idx, "Total Spent"]) + dtotal
-                    save_encrypted_csv(customers_df, CUSTOMERS_FILE)
+                    save_data_csv(customers_df, CUSTOMERS_FILE)
 
-                    # Save Order
                     new_ord = pd.DataFrame([{
                         "Order ID": new_id, "Customer Name": dcust_name, "Mobile": str(dmobile),
                         "Customer Type": "Delivery", "Service": dservice, "Items Count": ditems, "Weight (KG)": dweight_kg,
@@ -464,14 +435,13 @@ if nav_selection == "🛵 Delivery Portal":
                         "Special Instructions": "Doorstep Pickup", "Assigned Delivery": "Delivery Boy"
                     }])
                     orders_df = pd.concat([orders_df, new_ord], ignore_index=True)
-                    save_encrypted_csv(orders_df, ORDERS_FILE)
+                    save_data_csv(orders_df, ORDERS_FILE)
                     st.success(f"Pickup Order Created: {new_id}")
                     
                     dwa_msg = f"✨ *DRY1 Care Doorstep Pickup Receipt*\n\nDear {dcust_name},\nYour pickup order is booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {dservice}\n⚖️ Weight: {dweight_kg} KG\n💰 Total: ₹{dtotal:.2f}\n💵 Paid: ₹{dpaid:.2f}\n🔴 Balance: ₹{dbal:.2f}\n📅 Promised Date: {dpromised_date}\n\nThank you!"
                     dwa_url = f"https://api.whatsapp.com/send?phone=91{dmobile}&text={urllib.parse.quote(dwa_msg)}"
                     st.markdown(f'<a href="{dwa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt to Customer</a>', unsafe_allow_html=True)
 
-    # TAB 2: ACTIVE DELIVERY ORDERS
     with d_tab2:
         delivery_orders = orders_df[orders_df["Customer Type"] == "Delivery"].copy()
         if not delivery_orders.empty:
@@ -540,7 +510,7 @@ elif nav_selection == "📝 New Billing & Order":
                     customers_df.at[c_idx, "Type"] = cust_type
                     customers_df.at[c_idx, "Total Orders"] = int(customers_df.at[c_idx, "Total Orders"]) + 1
                     customers_df.at[c_idx, "Total Spent"] = float(customers_df.at[c_idx, "Total Spent"]) + total
-                save_encrypted_csv(customers_df, CUSTOMERS_FILE)
+                save_data_csv(customers_df, CUSTOMERS_FILE)
 
                 new_ord = pd.DataFrame([{
                     "Order ID": new_id, "Customer Name": cust_name, "Mobile": str(mobile),
@@ -551,7 +521,7 @@ elif nav_selection == "📝 New Billing & Order":
                     "Special Instructions": "", "Assigned Delivery": "Unassigned"
                 }])
                 orders_df = pd.concat([orders_df, new_ord], ignore_index=True)
-                save_encrypted_csv(orders_df, ORDERS_FILE)
+                save_data_csv(orders_df, ORDERS_FILE)
                 st.success(f"Order Registered: {new_id}")
                 
                 wa_msg = f"✨ *DRY1 Care Receipt*\n\nDear {cust_name},\nYour order has been booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {service}\n⚖️ Weight: {weight_kg} KG\n💰 Total: ₹{total:.2f}\n💵 Paid: ₹{paid:.2f}\n🔴 Balance: ₹{bal:.2f}\n📅 Promised Date: {promised_date}\n\nThank you!"
@@ -577,7 +547,7 @@ elif nav_selection in ["📊 Operations Dashboard", "📊 Master Operations"]:
             if st.button("Update Order Stage"):
                 idx = orders_df[orders_df["Order ID"] == sel_id].index[0]
                 orders_df.at[idx, "Order Status"] = new_st
-                save_encrypted_csv(orders_df, ORDERS_FILE)
+                save_data_csv(orders_df, ORDERS_FILE)
                 st.success(f"Order {sel_id} updated to {new_st}!")
                 
                 if new_st == "Ready":
@@ -674,7 +644,7 @@ elif nav_selection == "💸 Store Expenses Entry":
                         "Amount": exp_amt
                     }])
                     expenses_df = pd.concat([expenses_df, new_exp], ignore_index=True)
-                    save_encrypted_csv(expenses_df, EXPENSES_FILE)
+                    save_data_csv(expenses_df, EXPENSES_FILE)
                     st.success("Store Expense Recorded Successfully!")
                     st.rerun()
 
@@ -696,7 +666,7 @@ elif nav_selection == "🔒 Active Device Control":
                 if st.button("🔴 Force Logout Selected Device", type="primary"):
                     term_idx = sessions_df[sessions_df["Session ID"] == term_id].index[0]
                     sessions_df.at[term_idx, "Status"] = "Logged Out"
-                    save_encrypted_csv(sessions_df, SESSIONS_FILE)
+                    save_data_csv(sessions_df, SESSIONS_FILE)
                     st.success(f"Device Session {term_id} terminated successfully!")
                     st.rerun()
         else:
@@ -721,7 +691,7 @@ elif nav_selection == "📢 Marketing Tracker":
                 "Status": "Pending Followup", "Notes": lead_notes
             }])
             leads_df = pd.concat([leads_df, new_lead], ignore_index=True)
-            save_encrypted_csv(leads_df, LEADS_FILE)
+            save_data_csv(leads_df, LEADS_FILE)
             st.success("Marketing Lead Follow-up Saved!")
 
     st.markdown("---")
@@ -733,7 +703,7 @@ elif nav_selection == "📢 Marketing Tracker":
         status_choice = st.selectbox("Update Status", ["Pending Followup", "Converted", "Rejected"], index=["Pending Followup", "Converted", "Rejected"].index(leads_df.at[lead_row_idx, "Status"]))
         if st.button("Update Lead Status"):
             leads_df.at[lead_row_idx, "Status"] = status_choice
-            save_encrypted_csv(leads_df, LEADS_FILE)
+            save_data_csv(leads_df, LEADS_FILE)
             st.success(f"Lead {lead_sel} updated to {status_choice}!")
             st.rerun()
 
