@@ -4,8 +4,7 @@ import os
 import io
 import socket
 import random
-import urllib.parse
-import webbrowser
+import smtplib
 from datetime import datetime
 
 # Page Configuration
@@ -15,6 +14,24 @@ st.set_page_config(
     page_icon="💧",
     initial_sidebar_state="auto"
 )
+
+# --- EMAIL CONFIGURATION FOR AUTO OTP ---
+GMAIL_SENDER = "kavincivil112@gmail.com"
+GMAIL_APP_PASSWORD = "spjo ppvc cfir ivns"
+
+def send_email_otp(target_email, otp_code):
+    subject = "🔑 Dry1 CRM — Admin 2FA Login Verification Code"
+    body = f"Hello Admin,\n\nYour 2FA Login Security OTP Code for Dry1 Care CRM is: {otp_code}\n\nThis code is generated for secure access. Do not share this OTP with anyone.\n\nRegards,\nDry1 Care Security Team"
+    
+    email_message = f"From: {GMAIL_SENDER}\nTo: {target_email}\nSubject: {subject}\n\n{body}"
+    
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_SENDER, target_email, email_message.encode('utf-8'))
+        return True
+    except Exception:
+        return False
 
 # --- SIMPLE FILE STORAGE SETUP ---
 def load_data_csv(filepath, dtype=None):
@@ -34,6 +51,7 @@ ORDERS_FILE = "orders.csv"
 EXPENSES_FILE = "expenses.csv"
 LEADS_FILE = "marketing_leads.csv"
 SESSIONS_FILE = "active_sessions.csv"
+VENDORS_FILE = "vendor_purchases.csv"
 
 def init_db():
     if not os.path.exists(CUSTOMERS_FILE):
@@ -50,11 +68,14 @@ def init_db():
         save_data_csv(pd.DataFrame(columns=["Lead ID", "Customer Name", "Mobile", "Followup Date", "Status", "Notes"]), LEADS_FILE)
     if not os.path.exists(SESSIONS_FILE):
         save_data_csv(pd.DataFrame(columns=["Session ID", "Device Name", "IP Address", "Role", "Login Time", "Status"]), SESSIONS_FILE)
+    if not os.path.exists(VENDORS_FILE):
+        save_data_csv(pd.DataFrame(columns=["Purchase Date", "Vendor Name", "Contact Person", "Mobile", "Chemicals/Items", "Quantity/Specs", "Total Cost"]), VENDORS_FILE)
 
 init_db()
 
 # --- HELPER FUNCTIONS ---
 ADMIN_MOBILE = "8056166017"
+ADMIN_EMAIL = "kavincivil112@gmail.com"
 STORE_UPI_ID = "praveenvp888-2@okaxis"
 
 def mask_mobile(mobile_str):
@@ -86,6 +107,14 @@ STYLING = """
     
     header[data-testid="stHeader"] { display: none !important; }
     .stApp { background: #F1F5F9 !important; color: #0F172A !important; }
+    
+    /* FIX FOR KEYBOARD_DOUBLE TOOLTIP BUG */
+    [data-testid="stSidebarCollapseButton"] span,
+    [data-testid="stSidebarNav"] span[data-testid="stHeaderActionElements"],
+    button[aria-label="Collapse sidebar"] span {
+        font-size: 0px !important;
+        color: transparent !important;
+    }
     
     [data-testid="stSidebar"] { 
         background: linear-gradient(180deg, #0F172A 0%, #1E293B 100%) !important; 
@@ -238,9 +267,9 @@ if not st.session_state.logged_in:
                             st.session_state.generated_otp = otp
                             st.session_state.otp_sent = True
                             
-                            wa_otp_msg = f"🔑 Your Dry1 CRM Admin 2FA Login OTP is: *{otp}*"
-                            wa_url = f"https://api.whatsapp.com/send?phone=91{ADMIN_MOBILE}&text={urllib.parse.quote(wa_otp_msg)}"
-                            webbrowser.open(wa_url)
+                            sent_status = send_email_otp(ADMIN_EMAIL, otp)
+                            if not sent_status:
+                                st.warning("⚠️ Email send failed. Check internet connectivity.")
                             st.rerun()
                         else:
                             dev_name, dev_ip = get_device_info()
@@ -262,13 +291,13 @@ if not st.session_state.logged_in:
         else:
             with st.container():
                 st.subheader("🔐 Admin 2FA Verification")
-                st.info(f"📱 An OTP has been sent to **+91 ******{ADMIN_MOBILE[-4:]}** via WhatsApp.")
+                st.info(f"📧 An OTP has been sent to Admin Email: **{ADMIN_EMAIL}**")
                 
                 user_otp = st.text_input("Enter 6-Digit OTP Code", max_chars=6, placeholder="••••••")
                 
                 col_b1, col_b2 = st.columns(2)
                 with col_b1:
-                    if st.button("Verify OTP & Login"):
+                    if st.button("Verify OTP & Login", type="primary"):
                         if user_otp == st.session_state.generated_otp:
                             dev_name, dev_ip = get_device_info()
                             sess_id = f"SESS-{random.randint(10000,99999)}"
@@ -308,6 +337,7 @@ customers_df = load_data_csv(CUSTOMERS_FILE, dtype={"Mobile": str})
 expenses_df = load_data_csv(EXPENSES_FILE)
 leads_df = load_data_csv(LEADS_FILE, dtype={"Mobile": str})
 sessions_df = load_data_csv(SESSIONS_FILE)
+vendors_df = load_data_csv(VENDORS_FILE, dtype={"Mobile": str})
 
 # --- ROLE-BASED NAVIGATION MENU ---
 menu_options = []
@@ -316,6 +346,7 @@ if user_role == "👑 Admin":
         "📊 Master Operations", 
         "📜 Orders History & Reports",
         "📈 Financial Analytics", 
+        "🚚 Vendor & Chemical Purchases",
         "👤 Customer Master DB", 
         "💸 Store Expenses Entry", 
         "🔒 Active Device Control", 
@@ -352,9 +383,10 @@ if st.sidebar.button("🚪 Logout Session"):
     st.session_state.otp_sent = False
     st.rerun()
 
-# --- PROMISED DATE ALERTS ---
+# --- PROMISED DATE & MARKETING FOLLOWUP ALERTS ---
 today = datetime.now().date()
 
+# 1. Orders Delivery Alerts
 if user_role in ["👑 Admin", "👩‍💼 Reception", "🛵 Delivery Boy"] and not orders_df.empty:
     active_orders = orders_df[orders_df["Order Status"] != "Delivered"].copy()
     if not active_orders.empty:
@@ -377,8 +409,84 @@ if user_role in ["👑 Admin", "👩‍💼 Reception", "🛵 Delivery Boy"] and
                     st.markdown(f'<div class="alert-red">🚨 <b>RED ALERT (+{diff} Days Delay):</b> {status_txt} | Promised Date: {ord_row["Promised Date"]}</div>', unsafe_allow_html=True)
             except Exception: pass
 
-# ==================== MODULE: DELIVERY PORTAL (WITH DIRECT MOBILE BILLING) ====================
-if nav_selection == "🛵 Delivery Portal":
+# 2. Marketing Lead Follow-up Alerts (For Marketing Team & Admin)
+if user_role in ["👑 Admin", "📢 Marketing Team"] and not leads_df.empty:
+    pending_leads = leads_df[leads_df["Status"] == "Pending Followup"].copy()
+    if not pending_leads.empty:
+        st.markdown("### 📢 Marketing Follow-up Reminders & Alerts")
+        for _, lead_row in pending_leads.iterrows():
+            try:
+                f_date = datetime.strptime(str(lead_row["Followup Date"]), "%Y-%m-%d").date()
+                f_diff = (today - f_date).days
+                
+                lead_txt = f"Lead ID: <b>{lead_row['Lead ID']}</b> | Client Name: <b>{lead_row['Customer Name']}</b> ({mask_mobile(lead_row['Mobile']) if user_role != '👑 Admin' else lead_row['Mobile']}) | Notes: <i>{lead_row['Notes']}</i>"
+                
+                if f_diff == 0:
+                    st.markdown(f'<div class="alert-today">📞 <b>FOLLOW-UP TODAY:</b> {lead_txt}</div>', unsafe_allow_html=True)
+                elif f_diff == 1:
+                    st.markdown(f'<div class="alert-delay">🟧 <b>FOLLOW-UP OVERDUE (+1 Day):</b> {lead_txt} | Follow-up Date: {lead_row["Followup Date"]}</div>', unsafe_allow_html=True)
+                elif f_diff >= 2:
+                    st.markdown(f'<div class="alert-red">🚨 <b>RED ALERT: OVERDUE (+{f_diff} Days):</b> {lead_txt} | Scheduled Date: {lead_row["Followup Date"]}</div>', unsafe_allow_html=True)
+            except Exception: pass
+
+# ==================== MODULE: VENDOR & CHEMICAL PURCHASES (ADMIN ONLY) ====================
+if nav_selection == "🚚 Vendor & Chemical Purchases":
+    if user_role != "👑 Admin":
+        st.error("🔒 Access Restricted: Vendor Details can only be accessed by Admin.")
+    else:
+        st.subheader("🚚 Vendor Details & Laundry Chemical Purchases")
+        
+        with st.container(border=True):
+            st.markdown("##### ➕ Add Vendor Chemical Purchase Entry")
+            vcol1, vcol2 = st.columns(2)
+            with vcol1:
+                v_name = st.text_input("Vendor Company Name", placeholder="e.g., ABC Chemical Industries")
+                v_contact = st.text_input("Contact Person Name", placeholder="e.g., Suresh Kumar")
+                v_mobile = st.text_input("Vendor Mobile Number", placeholder="10-digit number")
+            with vcol2:
+                v_pdate = st.date_input("Purchase Date", value=today)
+                v_chem = st.text_input("Chemicals Purchased", placeholder="e.g., Stain Remover, Washing Powder, Fabric Softener")
+                v_specs = st.text_input("Quantity / Package Specs", placeholder="e.g., 25 KG Drum / 5 Ltr Can")
+            
+            v_cost = st.number_input("Total Purchase Cost (₹)", min_value=0.0, step=100.0)
+            
+            if st.button("💾 Save Purchase & Auto-Add to Expenses", type="primary"):
+                if not v_name or not v_chem or v_cost <= 0:
+                    st.error("Please fill Vendor Name, Chemicals Purchased, and Valid Cost Amount.")
+                else:
+                    new_v_entry = pd.DataFrame([{
+                        "Purchase Date": str(v_pdate),
+                        "Vendor Name": v_name,
+                        "Contact Person": v_contact,
+                        "Mobile": str(v_mobile),
+                        "Chemicals/Items": v_chem,
+                        "Quantity/Specs": v_specs,
+                        "Total Cost": v_cost
+                    }])
+                    vendors_df = pd.concat([vendors_df, new_v_entry], ignore_index=True)
+                    save_data_csv(vendors_df, VENDORS_FILE)
+                    
+                    new_exp = pd.DataFrame([{
+                        "Date": str(v_pdate),
+                        "Expense Category": "Chemicals & Detergents",
+                        "Description": f"Chemical Purchase from {v_name} ({v_chem})",
+                        "Amount": v_cost
+                    }])
+                    expenses_df = pd.concat([expenses_df, new_exp], ignore_index=True)
+                    save_data_csv(expenses_df, EXPENSES_FILE)
+                    
+                    st.success(f"✅ Purchase Recorded from '{v_name}' & Auto-calculated into Expenses (₹{v_cost:,.2f})!")
+                    st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.subheader("📋 Chemical Purchase & Vendor History")
+        if not vendors_df.empty:
+            st.dataframe(vendors_df, use_container_width=True)
+        else:
+            st.info("No vendor purchase entries recorded yet.")
+
+# ==================== MODULE: DELIVERY PORTAL ====================
+elif nav_selection == "🛵 Delivery Portal":
     st.subheader("🛵 Delivery Portal — Assigned Pickups & Direct Mobile Billing")
     
     d_tab1, d_tab2 = st.tabs(["📝 New Doorstep Pickup Billing", "📦 Active Delivery Orders"])
@@ -439,6 +547,7 @@ if nav_selection == "🛵 Delivery Portal":
                     save_data_csv(orders_df, ORDERS_FILE)
                     st.success(f"Pickup Order Created: {new_id}")
                     
+                    import urllib.parse
                     dwa_msg = f"✨ *DRY1 Care Doorstep Pickup Receipt*\n\nDear {dcust_name},\nYour pickup order is booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {dservice}\n⚖️ Weight: {dweight_kg} KG\n💰 Total: ₹{dtotal:.2f}\n💵 Paid: ₹{dpaid:.2f}\n🔴 Balance: ₹{dbal:.2f}\n📅 Promised Date: {dpromised_date}\n\nThank you!"
                     dwa_url = f"https://api.whatsapp.com/send?phone=91{dmobile}&text={urllib.parse.quote(dwa_msg)}"
                     st.markdown(f'<a href="{dwa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt to Customer</a>', unsafe_allow_html=True)
@@ -461,6 +570,7 @@ if nav_selection == "🛵 Delivery Portal":
                     </div>
                     """, unsafe_allow_html=True)
                     
+                    import urllib.parse
                     wa_call_msg = f"Hello {drow['Customer Name']}, I am reaching out from Dry1 Care regarding your order {drow['Order ID']} delivery."
                     wa_link = f"https://api.whatsapp.com/send?phone=91{drow['Mobile']}&text={urllib.parse.quote(wa_call_msg)}"
                     st.markdown(f'<a href="{wa_link}" target="_blank" class="wa-link-btn">💬 Chat / Contact Customer</a>', unsafe_allow_html=True)
@@ -525,6 +635,7 @@ elif nav_selection == "📝 New Billing & Order":
                 save_data_csv(orders_df, ORDERS_FILE)
                 st.success(f"Order Registered: {new_id}")
                 
+                import urllib.parse
                 wa_msg = f"✨ *DRY1 Care Receipt*\n\nDear {cust_name},\nYour order has been booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {service}\n⚖️ Weight: {weight_kg} KG\n💰 Total: ₹{total:.2f}\n💵 Paid: ₹{paid:.2f}\n🔴 Balance: ₹{bal:.2f}\n📅 Promised Date: {promised_date}\n\nThank you!"
                 wa_url = f"https://api.whatsapp.com/send?phone=91{mobile}&text={urllib.parse.quote(wa_msg)}"
                 st.markdown(f'<a href="{wa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt</a>', unsafe_allow_html=True)
@@ -551,6 +662,7 @@ elif nav_selection in ["📊 Operations Dashboard", "📊 Master Operations"]:
                 save_data_csv(orders_df, ORDERS_FILE)
                 st.success(f"Order {sel_id} updated to {new_st}!")
                 
+                import urllib.parse
                 if new_st == "Ready":
                     upi_qr = f"upi://pay?pa={STORE_UPI_ID}&am={target['Balance Amount']}&tn={sel_id}"
                     wa_ready = f"✨ *DRY1 Order Ready for Delivery*\n\nDear {target['Customer Name']},\nYour garments for Order {sel_id} are READY! 🧼\n\nBalance Due: ₹{target['Balance Amount']}\nPay via UPI: {upi_qr}\nOr pay upon pickup/delivery."
