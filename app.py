@@ -197,11 +197,6 @@ STYLING = """
         padding: 10px 14px !important;
     }
 
-    button[aria-label="Show password"], button[aria-label="Hide password"], div[data-testid="stTextInput"] button {
-        display: none !important;
-        visibility: hidden !important;
-    }
-
     .stButton > button {
         background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%) !important;
         color: #FFFFFF !important;
@@ -268,8 +263,11 @@ if not st.session_state.logged_in:
                 submit = st.form_submit_button("🔓 Authenticate & Access")
                 
                 if submit:
+                    clean_username = username.strip().lower()
+                    clean_password = password.strip()
+                    
                     req_user, req_pass = CREDENTIALS[role]
-                    if username == req_user and password == req_pass:
+                    if clean_username == req_user and clean_password == req_pass:
                         if role == "👑 Admin":
                             otp = str(random.randint(100000, 999999))
                             st.session_state.generated_otp = otp
@@ -304,7 +302,7 @@ if not st.session_state.logged_in:
                 col_b1, col_b2 = st.columns(2)
                 with col_b1:
                     if st.button("Verify OTP & Login", type="primary"):
-                        if user_otp == st.session_state.generated_otp:
+                        if user_otp.strip() == st.session_state.generated_otp:
                             dev_name, dev_ip = get_device_info()
                             sess_id = f"SESS-{random.randint(10000,99999)}"
                             st.session_state.session_id = sess_id
@@ -558,12 +556,10 @@ elif nav_selection == "🛵 Delivery Portal":
                     </div>
                     """, unsafe_allow_html=True)
 
-    # NEW EV SHIFT TRACKING TAB
     with d_tab3:
         st.markdown("### ⚡ Electric Vehicle (EV) Shift Start & End Logging")
         driver_name = st.text_input("Delivery Boy Name", value="Delivery Staff")
         
-        # Check active shift today
         today_str = str(today)
         active_shift = pd.DataFrame()
         if not shift_logs_df.empty:
