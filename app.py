@@ -5,15 +5,55 @@ import io
 import socket
 import random
 import smtplib
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timedelta
+from supabase import create_client, Client
 
 # Page Configuration
 st.set_page_config(
-    page_title="Dry1 — Multi-Role Laundry CRM", 
+    page_title="Dry1 Laundry & Saree Care CRM", 
     layout="wide", 
     page_icon="💧",
     initial_sidebar_state="auto"
 )
+
+# --- SUPABASE CLOUD DATABASE CONFIGURATION ---
+SUPABASE_URL = "https://vvnbwnhmkicoydojubxs.supabase.co"
+SUPABASE_KEY = "sb_publishable__fF3R7bDO-2DuEZKvYklvA_zWwrF9RP"
+
+@st.cache_resource
+def init_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+supabase = init_supabase()
+
+# --- OPTIMIZED FAST DATABASE HELPER FUNCTIONS WITH CACHING ---
+@st.cache_data(ttl=3)
+def load_data(table_name):
+    try:
+        response = supabase.table(table_name).select("*").execute()
+        df = pd.DataFrame(response.data)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def save_record(table_name, record_dict):
+    try:
+        supabase.table(table_name).insert(record_dict).execute()
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        st.error(f"Database Save Error: {e}")
+        return False
+
+def update_record(table_name, record_dict, match_col, match_val):
+    try:
+        supabase.table(table_name).update(record_dict).eq(match_col, match_val).execute()
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        st.error(f"Database Update Error: {e}")
+        return False
 
 # --- EMAIL CONFIGURATION FOR AUTO OTP ---
 GMAIL_SENDER = "kavincivil112@gmail.com"
@@ -21,7 +61,7 @@ GMAIL_APP_PASSWORD = "spjo ppvc cfir ivns"
 
 def send_email_otp(target_email, otp_code):
     subject = "🔑 Dry1 CRM — Admin 2FA Login Verification Code"
-    body = f"Hello Admin,\n\nYour 2FA Login Security OTP Code for Dry1 Care CRM is: {otp_code}\n\nThis code is generated for secure access. Do not share this OTP with anyone.\n\nRegards,\nDry1 Care Security Team"
+    body = f"Hello Admin,\n\nYour 2FA Login Security OTP Code for Dry1 Laundry & Saree Care CRM is: {otp_code}\n\nThis code is generated for secure access. Do not share this OTP with anyone.\n\nRegards,\nDry1 Care Security Team"
     
     email_message = f"From: {GMAIL_SENDER}\nTo: {target_email}\nSubject: {subject}\n\n{body}"
     
@@ -33,53 +73,21 @@ def send_email_otp(target_email, otp_code):
     except Exception:
         return False
 
-# --- SIMPLE FILE STORAGE SETUP ---
-def load_data_csv(filepath, dtype=None):
-    if not os.path.exists(filepath): 
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(filepath, dtype=dtype)
-    except Exception: 
-        return pd.DataFrame()
-
-def save_data_csv(df, filepath):
-    df.to_csv(filepath, index=False)
-
-# --- DATA FILE PATHS ---
-CUSTOMERS_FILE = "customers.csv"
-ORDERS_FILE = "orders.csv"
-EXPENSES_FILE = "expenses.csv"
-LEADS_FILE = "marketing_leads.csv"
-SESSIONS_FILE = "active_sessions.csv"
-VENDORS_FILE = "vendor_purchases.csv"
-
-def init_db():
-    if not os.path.exists(CUSTOMERS_FILE):
-        save_data_csv(pd.DataFrame(columns=["Mobile", "Name", "Type", "Total Orders", "Total Spent", "Notes"]), CUSTOMERS_FILE)
-    if not os.path.exists(ORDERS_FILE):
-        save_data_csv(pd.DataFrame(columns=[
-            "Order ID", "Customer Name", "Mobile", "Customer Type", "Service", "Items Count", "Weight (KG)", 
-            "Total Amount", "Paid Amount", "Balance Amount", "Payment Status", 
-            "Order Status", "Promised Date", "Created Date", "Month-Year", "Special Instructions", "Assigned Delivery"
-        ]), ORDERS_FILE)
-    if not os.path.exists(EXPENSES_FILE):
-        save_data_csv(pd.DataFrame(columns=["Date", "Expense Category", "Description", "Amount"]), EXPENSES_FILE)
-    if not os.path.exists(LEADS_FILE):
-        save_data_csv(pd.DataFrame(columns=["Lead ID", "Customer Name", "Mobile", "Followup Date", "Status", "Notes"]), LEADS_FILE)
-    if not os.path.exists(SESSIONS_FILE):
-        save_data_csv(pd.DataFrame(columns=["Session ID", "Device Name", "IP Address", "Role", "Login Time", "Status"]), SESSIONS_FILE)
-    if not os.path.exists(VENDORS_FILE):
-        save_data_csv(pd.DataFrame(columns=["Purchase Date", "Vendor Name", "Contact Person", "Mobile", "Chemicals/Items", "Quantity/Specs", "Total Cost"]), VENDORS_FILE)
-
-init_db()
-
-# --- HELPER FUNCTIONS ---
+# --- HELPER FUNCTIONS & CONFIG ---
 ADMIN_MOBILE = "8056166017"
 ADMIN_EMAIL = "kavincivil112@gmail.com"
 STORE_UPI_ID = "praveenvp888-2@okaxis"
 
+SERVICES_LIST = [
+    "Washing",
+    "Ironing",
+    "Saree Polish",
+    "Steam & Starch Ironing",
+    "Shoe Cleaning"
+]
+
 def mask_mobile(mobile_str):
-    m_str = str(mobile_str).strip()
+    m_str = str(mobile_str).strip() if mobile_str else ""
     if len(m_str) >= 10:
         return "*******" + m_str[-3:]
     return m_str
@@ -98,6 +106,7 @@ if "user_role" not in st.session_state: st.session_state.user_role = None
 if "otp_sent" not in st.session_state: st.session_state.otp_sent = False
 if "generated_otp" not in st.session_state: st.session_state.generated_otp = None
 if "session_id" not in st.session_state: st.session_state.session_id = None
+if "last_updated_ready_id" not in st.session_state: st.session_state.last_updated_ready_id = None
 
 # --- MODERN STYLING ---
 STYLING = """
@@ -108,7 +117,6 @@ STYLING = """
     header[data-testid="stHeader"] { display: none !important; }
     .stApp { background: #F1F5F9 !important; color: #0F172A !important; }
     
-    /* FIX FOR KEYBOARD_DOUBLE TOOLTIP BUG */
     [data-testid="stSidebarCollapseButton"] span,
     [data-testid="stSidebarNav"] span[data-testid="stHeaderActionElements"],
     button[aria-label="Collapse sidebar"] span {
@@ -210,8 +218,8 @@ STYLING = """
     
     .wa-link-btn {
         display: block; width: 100%; background: #22C55E; color: white !important;
-        text-align: center; padding: 12px; border-radius: 10px; font-weight: 700;
-        text-decoration: none !important; box-shadow: 0 4px 14px rgba(34, 197, 94, 0.35); margin-top: 10px;
+        text-align: center; padding: 10px; border-radius: 10px; font-weight: 700;
+        text-decoration: none !important; box-shadow: 0 4px 14px rgba(34, 197, 94, 0.35); margin-top: 8px;
     }
 </style>
 """
@@ -219,10 +227,10 @@ st.markdown(STYLING, unsafe_allow_html=True)
 
 # --- REAL-TIME SESSION LOGOUT CHECK ---
 if st.session_state.logged_in and st.session_state.session_id:
-    sessions_df = load_data_csv(SESSIONS_FILE)
+    sessions_df = load_data("active_sessions")
     if not sessions_df.empty:
-        my_session = sessions_df[sessions_df["Session ID"] == st.session_state.session_id]
-        if not my_session.empty and my_session.iloc[0]["Status"] == "Logged Out":
+        my_session = sessions_df[sessions_df["session_id"] == st.session_state.session_id]
+        if not my_session.empty and my_session.iloc[0]["status"] == "Logged Out":
             st.session_state.logged_in = False
             st.session_state.session_id = None
             st.error("🚨 Your session has been remotely terminated by the Administrator.")
@@ -238,7 +246,7 @@ if not st.session_state.logged_in:
             <div style="background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%); width: 76px; height: 76px; border-radius: 22px; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px auto; box-shadow: 0 12px 30px rgba(37, 99, 235, 0.38);">
                 <span style="font-size: 2.5rem;">💧</span>
             </div>
-            <h1 style="color: #0F172A; font-weight: 800; font-size: 2rem; margin: 0;">Dry1 Care CRM</h1>
+            <h1 style="color: #0F172A; font-weight: 800; font-size: 1.8rem; margin: 0;">Dry1 Laundry & Saree Care CRM</h1>
             <p style="color: #64748B; font-size: 0.9rem; font-weight: 600; margin-top: 6px;">Role-Based Authentication Portal</p>
         </div>
         """, unsafe_allow_html=True)
@@ -278,12 +286,10 @@ if not st.session_state.logged_in:
                             st.session_state.logged_in = True
                             st.session_state.user_role = role
                             
-                            sessions_df = load_data_csv(SESSIONS_FILE)
-                            new_sess = pd.DataFrame([{
-                                "Session ID": sess_id, "Device Name": dev_name, "IP Address": dev_ip,
-                                "Role": role, "Login Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Status": "Active"
-                            }])
-                            save_data_csv(pd.concat([sessions_df, new_sess], ignore_index=True), SESSIONS_FILE)
+                            save_record("active_sessions", {
+                                "session_id": sess_id, "device_name": dev_name, "ip_address": dev_ip,
+                                "role": role, "login_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "status": "Active"
+                            })
                             st.rerun()
                     else:
                         st.error("❌ Invalid Username or Password")
@@ -306,12 +312,10 @@ if not st.session_state.logged_in:
                             st.session_state.user_role = "👑 Admin"
                             st.session_state.otp_sent = False
                             
-                            sessions_df = load_data_csv(SESSIONS_FILE)
-                            new_sess = pd.DataFrame([{
-                                "Session ID": sess_id, "Device Name": dev_name, "IP Address": dev_ip,
-                                "Role": "👑 Admin", "Login Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Status": "Active"
-                            }])
-                            save_data_csv(pd.concat([sessions_df, new_sess], ignore_index=True), SESSIONS_FILE)
+                            save_record("active_sessions", {
+                                "session_id": sess_id, "device_name": dev_name, "ip_address": dev_ip,
+                                "role": "👑 Admin", "login_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "status": "Active"
+                            })
                             st.rerun()
                         else:
                             st.error("❌ Invalid OTP Code")
@@ -325,19 +329,21 @@ if not st.session_state.logged_in:
 
 st.sidebar.markdown(f"""
 <div class="sidebar-brand-card">
-    <h2 style="margin:0; font-weight:800; font-size:1.35rem; color:#FFFFFF;">💧 Dry1 Care</h2>
-    <p style="margin:3px 0 0 0; color:#94A3B8 !important; font-size:0.75rem;">Saree Care & Laundry CRM</p>
+    <h2 style="margin:0; font-weight:800; font-size:1.25rem; color:#FFFFFF;">💧 Dry1 Laundry</h2>
+    <p style="margin:3px 0 0 0; color:#94A3B8 !important; font-size:0.75rem;">Saree Care & CRM</p>
     <div class="role-badge">{st.session_state.user_role}</div>
 </div>
 """, unsafe_allow_html=True)
 
 user_role = st.session_state.user_role
-orders_df = load_data_csv(ORDERS_FILE, dtype={"Mobile": str})
-customers_df = load_data_csv(CUSTOMERS_FILE, dtype={"Mobile": str})
-expenses_df = load_data_csv(EXPENSES_FILE)
-leads_df = load_data_csv(LEADS_FILE, dtype={"Mobile": str})
-sessions_df = load_data_csv(SESSIONS_FILE)
-vendors_df = load_data_csv(VENDORS_FILE, dtype={"Mobile": str})
+
+orders_df = load_data("orders")
+customers_df = load_data("customers")
+expenses_df = load_data("expenses")
+leads_df = load_data("marketing_leads")
+sessions_df = load_data("active_sessions")
+vendors_df = load_data("vendor_purchases")
+shift_logs_df = load_data("delivery_shift_logs")
 
 # --- ROLE-BASED NAVIGATION MENU ---
 menu_options = []
@@ -347,6 +353,7 @@ if user_role == "👑 Admin":
         "📜 Orders History & Reports",
         "📈 Financial Analytics", 
         "🚚 Vendor & Chemical Purchases",
+        "🛵 Delivery Shift Logs",
         "👤 Customer Master DB", 
         "💸 Store Expenses Entry", 
         "🔒 Active Device Control", 
@@ -372,12 +379,7 @@ nav_selection = st.sidebar.radio("", menu_options, label_visibility="collapsed")
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
 if st.sidebar.button("🚪 Logout Session"):
     if st.session_state.session_id:
-        sessions_df = load_data_csv(SESSIONS_FILE)
-        if not sessions_df.empty:
-            idx_list = sessions_df[sessions_df["Session ID"] == st.session_state.session_id].index
-            if len(idx_list) > 0:
-                sessions_df.at[idx_list[0], "Status"] = "Logged Out"
-                save_data_csv(sessions_df, SESSIONS_FILE)
+        update_record("active_sessions", {"status": "Logged Out"}, "session_id", st.session_state.session_id)
     st.session_state.logged_in = False
     st.session_state.session_id = None
     st.session_state.otp_sent = False
@@ -386,58 +388,75 @@ if st.sidebar.button("🚪 Logout Session"):
 # --- PROMISED DATE & MARKETING FOLLOWUP ALERTS ---
 today = datetime.now().date()
 
-# 1. Orders Delivery Alerts
 if user_role in ["👑 Admin", "👩‍💼 Reception", "🛵 Delivery Boy"] and not orders_df.empty:
-    active_orders = orders_df[orders_df["Order Status"] != "Delivered"].copy()
+    active_orders = orders_df[orders_df["order_status"] != "Delivered"].copy()
     if not active_orders.empty:
         st.markdown("### 🚨 Promised Delivery Alerts")
         for _, ord_row in active_orders.iterrows():
             try:
-                prom_date = datetime.strptime(str(ord_row["Promised Date"]), "%Y-%m-%d").date()
+                prom_date = datetime.strptime(str(ord_row["promised_date"]), "%Y-%m-%d").date()
                 diff = (today - prom_date).days
                 
-                if user_role == "🛵 Delivery Boy" and ord_row["Customer Type"] != "Delivery":
+                if user_role == "🛵 Delivery Boy" and ord_row["customer_type"] != "Delivery":
                     continue
-                    
-                status_txt = f"Order ID: <b>{ord_row['Order ID']}</b> | Customer: <b>{ord_row['Customer Name']}</b> ({mask_mobile(ord_row['Mobile']) if user_role != '👑 Admin' else ord_row['Mobile']}) | Stage: <code>{ord_row['Order Status']}</code>"
+                
+                disp_mob = ord_row['mobile'] if user_role in ["👑 Admin", "👩‍💼 Reception"] else mask_mobile(ord_row['mobile'])
+                status_txt = f"Order ID: <b>{ord_row['order_id']}</b> | Customer: <b>{ord_row['customer_name']}</b> (📞 <b>{disp_mob}</b>) | Stage: <code>{ord_row['order_status']}</code>"
                 
                 if diff == 0:
                     st.markdown(f'<div class="alert-today">⚠️ <b>DUE TODAY:</b> {status_txt} | Promised Date: Today</div>', unsafe_allow_html=True)
                 elif diff == 1:
-                    st.markdown(f'<div class="alert-delay">🟧 <b>DELAYED (+1 Day):</b> {status_txt} | Promised Date: {ord_row["Promised Date"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="alert-delay">🟧 <b>DELAYED (+1 Day):</b> {status_txt} | Promised Date: {ord_row["promised_date"]}</div>', unsafe_allow_html=True)
                 elif diff >= 2:
-                    st.markdown(f'<div class="alert-red">🚨 <b>RED ALERT (+{diff} Days Delay):</b> {status_txt} | Promised Date: {ord_row["Promised Date"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="alert-red">🚨 <b>RED ALERT (+{diff} Days Delay):</b> {status_txt} | Promised Date: {ord_row["promised_date"]}</div>', unsafe_allow_html=True)
+                    
+                    alert_wa_msg = f"🚨 *RED ALERT: Order Delivery Delayed*\n\nOrder ID: {ord_row['order_id']}\nCustomer: {ord_row['customer_name']} ({ord_row['mobile']})\nPromised Date: {ord_row['promised_date']} (+{diff} Days Delay)\nStage: {ord_row['order_status']}"
+                    wa_admin_url = f"https://api.whatsapp.com/send?phone=91{ADMIN_MOBILE}&text={urllib.parse.quote(alert_wa_msg)}"
+                    st.markdown(f'<a href="{wa_admin_url}" target="_blank" class="wa-link-btn" style="background:#DC2626 !important;">📲 Send Red Alert to Admin WhatsApp</a>', unsafe_allow_html=True)
             except Exception: pass
 
-# 2. Marketing Lead Follow-up Alerts (For Marketing Team & Admin)
 if user_role in ["👑 Admin", "📢 Marketing Team"] and not leads_df.empty:
-    pending_leads = leads_df[leads_df["Status"] == "Pending Followup"].copy()
+    pending_leads = leads_df[leads_df["status"] == "Pending Followup"].copy()
     if not pending_leads.empty:
         st.markdown("### 📢 Marketing Follow-up Reminders & Alerts")
         for _, lead_row in pending_leads.iterrows():
             try:
-                f_date = datetime.strptime(str(lead_row["Followup Date"]), "%Y-%m-%d").date()
+                f_date = datetime.strptime(str(lead_row["followup_date"]), "%Y-%m-%d").date()
                 f_diff = (today - f_date).days
                 
-                lead_txt = f"Lead ID: <b>{lead_row['Lead ID']}</b> | Client Name: <b>{lead_row['Customer Name']}</b> ({mask_mobile(lead_row['Mobile']) if user_role != '👑 Admin' else lead_row['Mobile']}) | Notes: <i>{lead_row['Notes']}</i>"
+                disp_lead_mob = lead_row['mobile'] if user_role in ["👑 Admin", "📢 Marketing Team"] else mask_mobile(lead_row['mobile'])
+                lead_txt = f"Lead ID: <b>{lead_row['lead_id']}</b> | Client Name: <b>{lead_row['customer_name']}</b> (📞 <b>{disp_lead_mob}</b>) | Notes: <i>{lead_row['notes']}</i>"
                 
                 if f_diff == 0:
                     st.markdown(f'<div class="alert-today">📞 <b>FOLLOW-UP TODAY:</b> {lead_txt}</div>', unsafe_allow_html=True)
                 elif f_diff == 1:
-                    st.markdown(f'<div class="alert-delay">🟧 <b>FOLLOW-UP OVERDUE (+1 Day):</b> {lead_txt} | Follow-up Date: {lead_row["Followup Date"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="alert-delay">🟧 <b>FOLLOW-UP OVERDUE (+1 Day):</b> {lead_txt} | Scheduled Date: {lead_row["followup_date"]}</div>', unsafe_allow_html=True)
                 elif f_diff >= 2:
-                    st.markdown(f'<div class="alert-red">🚨 <b>RED ALERT: OVERDUE (+{f_diff} Days):</b> {lead_txt} | Scheduled Date: {lead_row["Followup Date"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="alert-red">🚨 <b>RED ALERT: OVERDUE (+{f_diff} Days):</b> {lead_txt} | Scheduled Date: {lead_row["followup_date"]}</div>', unsafe_allow_html=True)
+                    
+                    mkt_wa_msg = f"🚨 *RED ALERT: Marketing Lead Overdue*\n\nLead ID: {lead_row['lead_id']}\nClient Name: {lead_row['customer_name']} ({lead_row['mobile']})\nScheduled Date: {lead_row['followup_date']} (+{f_diff} Days Overdue)"
+                    wa_admin_mkt_url = f"https://api.whatsapp.com/send?phone=91{ADMIN_MOBILE}&text={urllib.parse.quote(mkt_wa_msg)}"
+                    st.markdown(f'<a href="{wa_admin_mkt_url}" target="_blank" class="wa-link-btn" style="background:#DC2626 !important;">📲 Send Marketing Delay Alert to Admin WhatsApp</a>', unsafe_allow_html=True)
             except Exception: pass
 
-# ==================== MODULE: VENDOR & CHEMICAL PURCHASES (ADMIN ONLY) ====================
-if nav_selection == "🚚 Vendor & Chemical Purchases":
+# ==================== MODULE: DELIVERY SHIFT LOGS (ADMIN VIEW) ====================
+if nav_selection == "🛵 Delivery Shift Logs":
+    if user_role != "👑 Admin":
+        st.error("🔒 Access Restricted: Delivery Shift Logs can only be accessed by Admin.")
+    else:
+        st.subheader("🛵 Delivery Boy EV Shift Logs & Odometer / Charge History")
+        if not shift_logs_df.empty:
+            st.dataframe(shift_logs_df, use_container_width=True)
+        else:
+            st.info("No EV shift entries logged yet.")
+
+# ==================== MODULE: VENDOR & CHEMICAL PURCHASES ====================
+elif nav_selection == "🚚 Vendor & Chemical Purchases":
     if user_role != "👑 Admin":
         st.error("🔒 Access Restricted: Vendor Details can only be accessed by Admin.")
     else:
         st.subheader("🚚 Vendor Details & Laundry Chemical Purchases")
-        
         with st.container(border=True):
-            st.markdown("##### ➕ Add Vendor Chemical Purchase Entry")
             vcol1, vcol2 = st.columns(2)
             with vcol1:
                 v_name = st.text_input("Vendor Company Name", placeholder="e.g., ABC Chemical Industries")
@@ -445,7 +464,7 @@ if nav_selection == "🚚 Vendor & Chemical Purchases":
                 v_mobile = st.text_input("Vendor Mobile Number", placeholder="10-digit number")
             with vcol2:
                 v_pdate = st.date_input("Purchase Date", value=today)
-                v_chem = st.text_input("Chemicals Purchased", placeholder="e.g., Stain Remover, Washing Powder, Fabric Softener")
+                v_chem = st.text_input("Chemicals Purchased", placeholder="e.g., Stain Remover, Washing Powder")
                 v_specs = st.text_input("Quantity / Package Specs", placeholder="e.g., 25 KG Drum / 5 Ltr Can")
             
             v_cost = st.number_input("Total Purchase Cost (₹)", min_value=0.0, step=100.0)
@@ -454,56 +473,39 @@ if nav_selection == "🚚 Vendor & Chemical Purchases":
                 if not v_name or not v_chem or v_cost <= 0:
                     st.error("Please fill Vendor Name, Chemicals Purchased, and Valid Cost Amount.")
                 else:
-                    new_v_entry = pd.DataFrame([{
-                        "Purchase Date": str(v_pdate),
-                        "Vendor Name": v_name,
-                        "Contact Person": v_contact,
-                        "Mobile": str(v_mobile),
-                        "Chemicals/Items": v_chem,
-                        "Quantity/Specs": v_specs,
-                        "Total Cost": v_cost
-                    }])
-                    vendors_df = pd.concat([vendors_df, new_v_entry], ignore_index=True)
-                    save_data_csv(vendors_df, VENDORS_FILE)
-                    
-                    new_exp = pd.DataFrame([{
-                        "Date": str(v_pdate),
-                        "Expense Category": "Chemicals & Detergents",
-                        "Description": f"Chemical Purchase from {v_name} ({v_chem})",
-                        "Amount": v_cost
-                    }])
-                    expenses_df = pd.concat([expenses_df, new_exp], ignore_index=True)
-                    save_data_csv(expenses_df, EXPENSES_FILE)
-                    
-                    st.success(f"✅ Purchase Recorded from '{v_name}' & Auto-calculated into Expenses (₹{v_cost:,.2f})!")
+                    save_record("vendor_purchases", {
+                        "purchase_date": str(v_pdate), "vendor_name": v_name,
+                        "contact_person": v_contact, "mobile": str(v_mobile),
+                        "chemicals_items": v_chem, "quantity_specs": v_specs, "total_cost": float(v_cost)
+                    })
+                    save_record("expenses", {
+                        "date": str(v_pdate), "expense_category": "Chemical & Detergent",
+                        "description": f"Chemical Purchase from {v_name} ({v_chem})", "amount": float(v_cost)
+                    })
+                    st.success(f"✅ Purchase Recorded & Auto-calculated into Expenses (₹{v_cost:,.2f})!")
                     st.rerun()
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📋 Chemical Purchase & Vendor History")
         if not vendors_df.empty:
             st.dataframe(vendors_df, use_container_width=True)
-        else:
-            st.info("No vendor purchase entries recorded yet.")
 
-# ==================== MODULE: DELIVERY PORTAL ====================
+# ==================== MODULE: DELIVERY PORTAL (WITH EV SHIFT TRACKING) ====================
 elif nav_selection == "🛵 Delivery Portal":
-    st.subheader("🛵 Delivery Portal — Assigned Pickups & Direct Mobile Billing")
-    
-    d_tab1, d_tab2 = st.tabs(["📝 New Doorstep Pickup Billing", "📦 Active Delivery Orders"])
+    st.subheader("🛵 Delivery Portal — Assigned Pickups & EV Shift Tracker")
+    d_tab1, d_tab2, d_tab3 = st.tabs(["📝 New Doorstep Pickup Billing", "📦 Active Delivery Orders", "⚡ EV Shift Tracking (Start / End Shift)"])
     
     with d_tab1:
-        st.markdown("##### 📝 Create Doorstep Pickup Order")
         with st.form("delivery_pickup_form"):
             dmobile = st.text_input("Customer Mobile Number", placeholder="10-digit number")
             dcust_name = st.text_input("Customer Name")
-            dservice = st.selectbox("Service Offered", ["Saree Roll Polish Ironing", "Shoe Cleaning Service", "Stain Removal Service", "Washing Machines", "Steam & Starch Ironing"])
+            dservice = st.selectbox("Service Offered", SERVICES_LIST)
             
             dcol1, dcol2 = st.columns(2)
             with dcol1: ditems = st.number_input("Items Count", min_value=1, value=1)
             with dcol2: dweight_kg = st.number_input("Weight (KG)", min_value=0.0, step=0.5, value=0.0)
             
             dpromised_date = st.date_input("Promised Delivery Date")
-            
             pcol1, pcol2 = st.columns(2)
             with pcol1: dtotal = st.number_input("Total Amount (₹)", min_value=0.0, step=50.0)
             with pcol2: dpaid = st.number_input("Paid Amount (₹)", min_value=0.0, step=50.0)
@@ -512,7 +514,6 @@ elif nav_selection == "🛵 Delivery Portal":
             st.write(f"**Pending Balance:** ₹{dbal}")
 
             dsubmit = st.form_submit_button("🚀 Confirm Pickup & Generate Receipt")
-            
             if dsubmit:
                 if not dmobile or not dcust_name or dtotal <= 0:
                     st.error("Please enter Mobile, Name, and Total Amount.")
@@ -520,63 +521,102 @@ elif nav_selection == "🛵 Delivery Portal":
                     new_id = f"DRY1-2026-{len(orders_df)+1:06d}"
                     curr_month_yr = today.strftime("%B %Y")
                     
-                    existing_cust = customers_df[customers_df["Mobile"] == str(dmobile)] if not customers_df.empty else pd.DataFrame()
-                    if existing_cust.empty:
-                        new_cust = pd.DataFrame([{
-                            "Mobile": str(dmobile), "Name": dcust_name, "Type": "Delivery",
-                            "Total Orders": 1, "Total Spent": dtotal, "Notes": "Created via Delivery Boy Portal"
-                        }])
-                        customers_df = pd.concat([customers_df, new_cust], ignore_index=True)
-                    else:
-                        c_idx = customers_df[customers_df["Mobile"] == str(dmobile)].index[0]
-                        customers_df.at[c_idx, "Name"] = dcust_name
-                        customers_df.at[c_idx, "Type"] = "Delivery"
-                        customers_df.at[c_idx, "Total Orders"] = int(customers_df.at[c_idx, "Total Orders"]) + 1
-                        customers_df.at[c_idx, "Total Spent"] = float(customers_df.at[c_idx, "Total Spent"]) + dtotal
-                    save_data_csv(customers_df, CUSTOMERS_FILE)
-
-                    new_ord = pd.DataFrame([{
-                        "Order ID": new_id, "Customer Name": dcust_name, "Mobile": str(dmobile),
-                        "Customer Type": "Delivery", "Service": dservice, "Items Count": ditems, "Weight (KG)": dweight_kg,
-                        "Total Amount": dtotal, "Paid Amount": dpaid, "Balance Amount": dbal,
-                        "Payment Status": "PAID" if dbal == 0 else "PENDING", "Order Status": "Order Created",
-                        "Promised Date": str(dpromised_date), "Created Date": str(today), "Month-Year": curr_month_yr,
-                        "Special Instructions": "Doorstep Pickup", "Assigned Delivery": "Delivery Boy"
-                    }])
-                    orders_df = pd.concat([orders_df, new_ord], ignore_index=True)
-                    save_data_csv(orders_df, ORDERS_FILE)
+                    save_record("customers", {
+                        "mobile": str(dmobile), "name": dcust_name, "type": "Delivery",
+                        "total_orders": 1, "total_spent": float(dtotal), "notes": "Created via Delivery Boy Portal"
+                    })
+                    save_record("orders", {
+                        "order_id": new_id, "customer_name": dcust_name, "mobile": str(dmobile),
+                        "customer_type": "Delivery", "service": dservice, "items_count": int(ditems),
+                        "weight_kg": float(dweight_kg), "total_amount": float(dtotal), "paid_amount": float(dpaid),
+                        "balance_amount": float(dbal), "payment_status": "PAID" if dbal == 0 else "PENDING",
+                        "order_status": "Order Created", "promised_date": str(dpromised_date),
+                        "created_date": str(today), "month_year": curr_month_yr,
+                        "special_instructions": "Doorstep Pickup", "assigned_delivery": "Delivery Boy"
+                    })
                     st.success(f"Pickup Order Created: {new_id}")
                     
-                    import urllib.parse
-                    dwa_msg = f"✨ *DRY1 Care Doorstep Pickup Receipt*\n\nDear {dcust_name},\nYour pickup order is booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {dservice}\n⚖️ Weight: {dweight_kg} KG\n💰 Total: ₹{dtotal:.2f}\n💵 Paid: ₹{dpaid:.2f}\n🔴 Balance: ₹{dbal:.2f}\n📅 Promised Date: {dpromised_date}\n\nThank you!"
+                    dwa_msg = f"✨ *DRY1 Laundry & Saree Care Pickup Receipt*\n\nDear {dcust_name},\nYour pickup order is booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {dservice}\n⚖️ Weight: {dweight_kg} KG\n💰 Total: ₹{dtotal:.2f}\n💵 Paid: ₹{dpaid:.2f}\n🔴 Balance: ₹{dbal:.2f}\n📅 Promised Date: {dpromised_date}\n\nThank you!"
                     dwa_url = f"https://api.whatsapp.com/send?phone=91{dmobile}&text={urllib.parse.quote(dwa_msg)}"
-                    st.markdown(f'<a href="{dwa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt to Customer</a>', unsafe_allow_html=True)
+                    st.markdown(f'<a href="{dwa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt</a>', unsafe_allow_html=True)
 
     with d_tab2:
-        delivery_orders = orders_df[orders_df["Customer Type"] == "Delivery"].copy()
+        delivery_orders = orders_df[orders_df["customer_type"] == "Delivery"].copy() if not orders_df.empty else pd.DataFrame()
         if not delivery_orders.empty:
             for _, drow in delivery_orders.iterrows():
                 with st.container():
                     st.markdown(f"""
                     <div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:16px; padding:16px; margin-bottom:14px; box-shadow:0 4px 12px rgba(0,0,0,0.03);">
-                        <div style="font-size:1.1rem; font-weight:800; color:#0F172A;">📦 Order #{drow['Order ID']}</div>
+                        <div style="font-size:1.1rem; font-weight:800; color:#0F172A;">📦 Order #{drow['order_id']}</div>
                         <div style="color:#475569; font-size:0.9rem; margin-top:4px;">
-                            👤 <b>Customer:</b> {drow['Customer Name']}<br>
-                            📱 <b>Mobile:</b> {mask_mobile(drow['Mobile'])}<br>
-                            🧼 <b>Service:</b> {drow['Service']} ({drow['Weight (KG)']} KG)<br>
-                            💰 <b>Balance Due:</b> ₹{drow['Balance Amount']}<br>
-                            📅 <b>Promised Date:</b> {drow['Promised Date']}
+                            👤 <b>Customer:</b> {drow['customer_name']}<br>
+                            📱 <b>Mobile:</b> {mask_mobile(drow['mobile'])}<br>
+                            🧼 <b>Service:</b> {drow['service']} ({drow['weight_kg']} KG)<br>
+                            💰 <b>Balance Due:</b> ₹{drow['balance_amount']}<br>
+                            📅 <b>Promised Date:</b> {drow['promised_date']}
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
+
+    # NEW EV SHIFT TRACKING TAB
+    with d_tab3:
+        st.markdown("### ⚡ Electric Vehicle (EV) Shift Start & End Logging")
+        driver_name = st.text_input("Delivery Boy Name", value="Delivery Staff")
+        
+        # Check active shift today
+        today_str = str(today)
+        active_shift = pd.DataFrame()
+        if not shift_logs_df.empty:
+            active_shift = shift_logs_df[(shift_logs_df["driver_name"] == driver_name) & 
+                                         (shift_logs_df["shift_date"] == today_str) & 
+                                         (shift_logs_df["status"] == "Ongoing Shift")]
+
+        col_s1, col_s2 = st.columns(2)
+        
+        with col_s1:
+            st.markdown("#### 🟢 Start Shift (Morning / Entry)")
+            if active_shift.empty:
+                with st.form("start_shift_form"):
+                    s_km = st.number_input("Start Odometer Reading (KM)", min_value=0.0, step=1.0)
+                    s_bat = st.slider("Start Battery Charge (%)", min_value=0, max_value=100, value=100)
                     
-                    import urllib.parse
-                    wa_call_msg = f"Hello {drow['Customer Name']}, I am reaching out from Dry1 Care regarding your order {drow['Order ID']} delivery."
-                    wa_link = f"https://api.whatsapp.com/send?phone=91{drow['Mobile']}&text={urllib.parse.quote(wa_call_msg)}"
-                    st.markdown(f'<a href="{wa_link}" target="_blank" class="wa-link-btn">💬 Chat / Contact Customer</a>', unsafe_allow_html=True)
-                    st.markdown("<br>", unsafe_allow_html=True)
-        else: 
-            st.info("No active delivery orders assigned for today.")
+                    if st.form_submit_button("🚀 Start Shift"):
+                        save_record("delivery_shift_logs", {
+                            "driver_name": driver_name,
+                            "shift_date": today_str,
+                            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "start_km": float(s_km),
+                            "start_battery_pct": int(s_bat),
+                            "status": "Ongoing Shift"
+                        })
+                        st.success("🟢 Shift Started & Logged Successfully!")
+                        st.rerun()
+            else:
+                s_row = active_shift.iloc[0]
+                st.info(f"✅ **Shift Already Active!**\n\n* **Start Time:** {s_row['start_time']}\n* **Start KM:** {s_row['start_km']} KM\n* **Start Battery:** {s_row['start_battery_pct']}%")
+
+        with col_s2:
+            st.markdown("#### 🔴 End Shift (Evening / Exit)")
+            if not active_shift.empty:
+                s_row = active_shift.iloc[0]
+                with st.form("end_shift_form"):
+                    e_km = st.number_input("End Odometer Reading (KM)", min_value=float(s_row['start_km']), step=1.0)
+                    e_bat = st.slider("End Battery Charge (%)", min_value=0, max_value=100, value=s_row['start_battery_pct'])
+                    
+                    if st.form_submit_button("🏁 End Shift & Calculate Run"):
+                        tot_run = float(e_km) - float(s_row['start_km'])
+                        update_record("delivery_shift_logs", {
+                            "end_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "end_km": float(e_km),
+                            "total_km": tot_run,
+                            "end_battery_pct": int(e_bat),
+                            "status": "Completed"
+                        }, "id", int(s_row['id']))
+                        
+                        st.success(f"🏁 Shift Completed!\n\n🛵 **Total Distance Run:** {tot_run} KM\n🔋 **Battery Used:** {s_row['start_battery_pct'] - e_bat}%")
+                        st.rerun()
+            else:
+                st.warning("Start your shift first to unlock End Shift logging.")
 
 # ==================== MODULE: BILLING (RECEPTION ONLY) ====================
 elif nav_selection == "📝 New Billing & Order":
@@ -588,7 +628,7 @@ elif nav_selection == "📝 New Billing & Order":
             cust_name = st.text_input("Customer Name")
             cust_type = st.selectbox("Customer Type", ["Walk-in", "Delivery"])
         with col2:
-            service = st.selectbox("Select Service Offered", ["Saree Roll Polish Ironing", "Shoe Cleaning Service", "Stain Removal Service", "Washing Machines", "Steam & Starch Ironing"])
+            service = st.selectbox("Select Service Offered", SERVICES_LIST)
             bcol1, bcol2 = st.columns(2)
             with bcol1: items = st.number_input("Items Count", min_value=1, value=1)
             with bcol2: weight_kg = st.number_input("Weight (KG)", min_value=0.0, step=0.5, value=0.0)
@@ -608,35 +648,22 @@ elif nav_selection == "📝 New Billing & Order":
                 new_id = f"DRY1-2026-{len(orders_df)+1:06d}"
                 curr_month_yr = today.strftime("%B %Y")
                 
-                existing_cust = customers_df[customers_df["Mobile"] == str(mobile)] if not customers_df.empty else pd.DataFrame()
-                if existing_cust.empty:
-                    new_cust = pd.DataFrame([{
-                        "Mobile": str(mobile), "Name": cust_name, "Type": cust_type,
-                        "Total Orders": 1, "Total Spent": total, "Notes": ""
-                    }])
-                    customers_df = pd.concat([customers_df, new_cust], ignore_index=True)
-                else:
-                    c_idx = customers_df[customers_df["Mobile"] == str(mobile)].index[0]
-                    customers_df.at[c_idx, "Name"] = cust_name
-                    customers_df.at[c_idx, "Type"] = cust_type
-                    customers_df.at[c_idx, "Total Orders"] = int(customers_df.at[c_idx, "Total Orders"]) + 1
-                    customers_df.at[c_idx, "Total Spent"] = float(customers_df.at[c_idx, "Total Spent"]) + total
-                save_data_csv(customers_df, CUSTOMERS_FILE)
-
-                new_ord = pd.DataFrame([{
-                    "Order ID": new_id, "Customer Name": cust_name, "Mobile": str(mobile),
-                    "Customer Type": cust_type, "Service": service, "Items Count": items, "Weight (KG)": weight_kg,
-                    "Total Amount": total, "Paid Amount": paid, "Balance Amount": bal,
-                    "Payment Status": "PAID" if bal == 0 else "PENDING", "Order Status": "Order Created",
-                    "Promised Date": str(promised_date), "Created Date": str(today), "Month-Year": curr_month_yr,
-                    "Special Instructions": "", "Assigned Delivery": "Unassigned"
-                }])
-                orders_df = pd.concat([orders_df, new_ord], ignore_index=True)
-                save_data_csv(orders_df, ORDERS_FILE)
+                save_record("customers", {
+                    "mobile": str(mobile), "name": cust_name, "type": cust_type,
+                    "total_orders": 1, "total_spent": float(total), "notes": ""
+                })
+                save_record("orders", {
+                    "order_id": new_id, "customer_name": cust_name, "mobile": str(mobile),
+                    "customer_type": cust_type, "service": service, "items_count": int(items),
+                    "weight_kg": float(weight_kg), "total_amount": float(total), "paid_amount": float(paid),
+                    "balance_amount": float(bal), "payment_status": "PAID" if bal == 0 else "PENDING",
+                    "order_status": "Order Created", "promised_date": str(promised_date),
+                    "created_date": str(today), "month_year": curr_month_yr,
+                    "special_instructions": "", "assigned_delivery": "Unassigned"
+                })
                 st.success(f"Order Registered: {new_id}")
                 
-                import urllib.parse
-                wa_msg = f"✨ *DRY1 Care Receipt*\n\nDear {cust_name},\nYour order has been booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {service}\n⚖️ Weight: {weight_kg} KG\n💰 Total: ₹{total:.2f}\n💵 Paid: ₹{paid:.2f}\n🔴 Balance: ₹{bal:.2f}\n📅 Promised Date: {promised_date}\n\nThank you!"
+                wa_msg = f"✨ *DRY1 Laundry & Saree Care Receipt*\n\nDear {cust_name},\nYour order has been booked!\n\n📋 Order ID: {new_id}\n🧼 Service: {service}\n⚖️ Weight: {weight_kg} KG\n💰 Total: ₹{total:.2f}\n💵 Paid: ₹{paid:.2f}\n🔴 Balance: ₹{bal:.2f}\n📅 Promised Date: {promised_date}\n\nThank you!"
                 wa_url = f"https://api.whatsapp.com/send?phone=91{mobile}&text={urllib.parse.quote(wa_msg)}"
                 st.markdown(f'<a href="{wa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt</a>', unsafe_allow_html=True)
 
@@ -645,38 +672,34 @@ elif nav_selection in ["📊 Operations Dashboard", "📊 Master Operations"]:
     st.subheader("📊 Operational Workflow")
     if not orders_df.empty:
         with st.container(border=True):
-            sel_id = st.selectbox("Select Order ID", orders_df["Order ID"].values)
-            target = orders_df[orders_df["Order ID"] == sel_id].iloc[0]
+            sel_id = st.selectbox("Select Order ID", orders_df["order_id"].values)
+            target = orders_df[orders_df["order_id"] == sel_id].iloc[0]
             
-            cust_mob_disp = target['Mobile'] if user_role == "👑 Admin" else mask_mobile(target['Mobile'])
-            st.write(f"**Customer:** {target['Customer Name']} ({cust_mob_disp}) | **Status:** `{target['Order Status']}`")
+            cust_mob_disp = target['mobile'] if user_role == "👑 Admin" else mask_mobile(target['mobile'])
+            st.write(f"**Customer:** {target['customer_name']} ({cust_mob_disp}) | **Status:** `{target['order_status']}`")
             
             WORKFLOW_STAGES = ["Order Created", "Ready", "Delivered"]
-            curr_idx = WORKFLOW_STAGES.index(target["Order Status"]) if target["Order Status"] in WORKFLOW_STAGES else 0
+            curr_idx = WORKFLOW_STAGES.index(target["order_status"]) if target["order_status"] in WORKFLOW_STAGES else 0
             
             new_st = st.selectbox("Update Status Stage", WORKFLOW_STAGES, index=curr_idx)
             
-            if st.button("Update Order Stage"):
-                idx = orders_df[orders_df["Order ID"] == sel_id].index[0]
-                orders_df.at[idx, "Order Status"] = new_st
-                save_data_csv(orders_df, ORDERS_FILE)
+            if st.button("Update Order Stage", type="primary"):
+                update_record("orders", {"order_status": new_st}, "order_id", sel_id)
+                st.session_state.last_updated_ready_id = sel_id if new_st == "Ready" else None
                 st.success(f"Order {sel_id} updated to {new_st}!")
-                
-                import urllib.parse
-                if new_st == "Ready":
-                    upi_qr = f"upi://pay?pa={STORE_UPI_ID}&am={target['Balance Amount']}&tn={sel_id}"
-                    wa_ready = f"✨ *DRY1 Order Ready for Delivery*\n\nDear {target['Customer Name']},\nYour garments for Order {sel_id} are READY! 🧼\n\nBalance Due: ₹{target['Balance Amount']}\nPay via UPI: {upi_qr}\nOr pay upon pickup/delivery."
-                    wa_url = f"https://api.whatsapp.com/send?phone=91{target['Mobile']}&text={urllib.parse.quote(wa_ready)}"
-                    st.markdown(f'<a href="{wa_url}" target="_blank" class="wa-link-btn">📲 Send "Garments Ready" WhatsApp Message</a>', unsafe_allow_html=True)
-                elif new_st == "Delivered":
-                    wa_del = f"✨ *DRY1 Order Delivered*\n\nDear {target['Customer Name']},\nYour Order {sel_id} has been successfully delivered. Thank you for choosing Dry1 Care!"
-                    wa_url = f"https://api.whatsapp.com/send?phone=91{target['Mobile']}&text={urllib.parse.quote(wa_del)}"
-                    st.markdown(f'<a href="{wa_url}" target="_blank" class="wa-link-btn">📲 Send "Delivered" Confirmation Message</a>', unsafe_allow_html=True)
+                st.rerun()
+
+            current_order_status = target["order_status"]
+            if current_order_status == "Ready" or st.session_state.last_updated_ready_id == sel_id:
+                upi_qr = f"upi://pay?pa={STORE_UPI_ID}&am={target['balance_amount']}&tn={sel_id}"
+                wa_ready = f"✨ *DRY1 Laundry Order Ready*\n\nDear {target['customer_name']},\nYour garments for Order *{sel_id}* are READY for collection/delivery! 🧼\n\n💵 Balance Due: ₹{target['balance_amount']}\n📲 Pay via UPI: {upi_qr}\n\nThank you for choosing Dry1 Care!"
+                wa_ready_url = f"https://api.whatsapp.com/send?phone=91{target['mobile']}&text={urllib.parse.quote(wa_ready)}"
+                st.markdown(f'<a href="{wa_ready_url}" target="_blank" class="wa-link-btn" style="background:#0284C7 !important;">📲 Send "Garments Ready" WhatsApp Confirmation</a>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         disp_df = orders_df.copy()
         if user_role != "👑 Admin":
-            disp_df["Mobile"] = disp_df["Mobile"].apply(mask_mobile)
+            disp_df["mobile"] = disp_df["mobile"].apply(mask_mobile)
         st.dataframe(disp_df, use_container_width=True)
 
 # ==================== MODULE: MONTHLY HISTORY ====================
@@ -684,31 +707,28 @@ elif nav_selection in ["📜 Monthly Orders History", "📜 Orders History & Rep
     st.subheader("📜 Monthly Orders History & Records")
     if not orders_df.empty:
         history_df = orders_df.copy()
-        available_months = history_df["Month-Year"].dropna().unique().tolist() if "Month-Year" in history_df.columns else []
+        available_months = history_df["month_year"].dropna().unique().tolist() if "month_year" in history_df.columns else []
         if not available_months: available_months = [today.strftime("%B %Y")]
             
         selected_month = st.selectbox("📅 Select Month Filter", ["All Months"] + available_months)
-        if selected_month != "All Months" and "Month-Year" in history_df.columns:
-            history_df = history_df[history_df["Month-Year"] == selected_month]
+        if selected_month != "All Months" and "month_year" in history_df.columns:
+            history_df = history_df[history_df["month_year"] == selected_month]
             
         if user_role == "🛵 Delivery Boy":
-            history_df = history_df[history_df["Customer Type"] == "Delivery"]
+            history_df = history_df[history_df["customer_type"] == "Delivery"]
         if user_role != "👑 Admin":
-            history_df["Mobile"] = history_df["Mobile"].apply(mask_mobile)
+            history_df["mobile"] = history_df["mobile"].apply(mask_mobile)
             
-        st.write(f"Showing `{len(history_df)}` records for **{selected_month}**")
         st.dataframe(history_df, use_container_width=True)
-    else:
-        st.info("No historical order records found.")
 
-# ==================== MODULE: FINANCIAL ANALYTICS ====================
+# ==================== MODULE: FINANCIAL ANALYTICS & GRAPH ====================
 elif nav_selection == "📈 Financial Analytics":
     if user_role not in ["👑 Admin", "👩‍💼 Reception"]:
         st.error("🔒 Access Restricted to Admin and Reception Only.")
     else:
-        st.subheader("📈 Financial Analytics & Monthly Profit Reports")
-        rev = orders_df["Total Amount"].sum() if not orders_df.empty else 0.0
-        exp = expenses_df["Amount"].sum() if not expenses_df.empty else 0.0
+        st.subheader("📈 Financial Analytics & Weekly Performance")
+        rev = orders_df["total_amount"].sum() if not orders_df.empty else 0.0
+        exp = expenses_df["amount"].sum() if not expenses_df.empty else 0.0
         profit = rev - exp
         
         pcol1, pcol2, pcol3 = st.columns(3)
@@ -717,19 +737,34 @@ elif nav_selection == "📈 Financial Analytics":
         pcol3.metric("Net Profit", f"₹{profit:,.2f}", delta=f"₹{profit:,.2f}")
         
         st.markdown("---")
-        st.subheader("📋 Breakdown of Recorded Expenses")
-        if not expenses_df.empty:
-            st.dataframe(expenses_df, use_container_width=True)
-        else:
-            st.info("No expense entries recorded yet.")
+        st.subheader("📊 Weekly Order Analytics (Walk-in vs Delivery)")
+        if not orders_df.empty:
+            orders_df['created_date'] = pd.to_datetime(orders_df['created_date'], errors='coerce')
+            last_7_days = today - timedelta(days=7)
+            recent_orders = orders_df[orders_df['created_date'] >= pd.to_datetime(last_7_days)].copy()
+            
+            if not recent_orders.empty:
+                recent_orders['Day'] = recent_orders['created_date'].dt.strftime('%a (%d %b)')
+                weekly_summary = recent_orders.groupby(['Day', 'customer_type'])['total_amount'].sum().unstack().fillna(0)
+                st.bar_chart(weekly_summary)
+            else:
+                st.info("No orders in last 7 days to display graph.")
 
 # ==================== MODULE: CUSTOMER MASTER DB ====================
 elif nav_selection == "👤 Customer Master DB":
     if user_role != "👑 Admin":
         st.error("🔒 Access Restricted: Customer Master Database can only be accessed by Admin.")
     else:
-        st.subheader("👤 Customer Master Database (Admin Full View)")
-        st.dataframe(customers_df, use_container_width=True)
+        st.subheader("👤 Customer Master Database (Admin View)")
+        type_filter = st.radio("🔍 Filter Customer Type:", ["All Customers", "Walk-in Only", "Delivery Only"], horizontal=True)
+        
+        filtered_cust = customers_df.copy() if not customers_df.empty else pd.DataFrame()
+        if not filtered_cust.empty:
+            if type_filter == "Walk-in Only":
+                filtered_cust = filtered_cust[filtered_cust["type"] == "Walk-in"]
+            elif type_filter == "Delivery Only":
+                filtered_cust = filtered_cust[filtered_cust["type"] == "Delivery"]
+            st.dataframe(filtered_cust, use_container_width=True)
 
 # ==================== MODULE: STORE EXPENSES ENTRY ====================
 elif nav_selection == "💸 Store Expenses Entry":
@@ -737,27 +772,29 @@ elif nav_selection == "💸 Store Expenses Entry":
         st.error("🔒 Access Restricted to Admin and Reception Only.")
     else:
         st.subheader("💸 Daily Store Expenses Entry")
+        
+        if user_role == "👩‍💼 Reception":
+            EXPENSE_CATEGORIES = ["Chemical & Detergent", "Repair", "Covers", "Ironing", "Petrol", "Water"]
+        else:
+            EXPENSE_CATEGORIES = ["Shop Rent", "Staff Salary", "Electricity", "Chemical & Detergent", "Repair", "Covers", "Ironing", "Petrol", "Water", "Miscellaneous"]
+            
         with st.container(border=True):
             col1, col2 = st.columns(2)
             with col1:
                 exp_date = st.date_input("Expense Date", value=today)
-                exp_cat = st.selectbox("Expense Category", ["Shop Rent", "Chemicals & Detergents", "Staff Salary", "Electricity / Utilities", "Equipment Repair", "Miscellaneous"])
+                exp_cat = st.selectbox("Expense Category", EXPENSE_CATEGORIES)
             with col2:
-                exp_amt = st.number_input("Expense Amount (₹)", min_value=0.0, step=100.0)
+                exp_amt = st.number_input("Expense Amount (₹)", min_value=0.0, step=50.0)
                 exp_desc = st.text_input("Expense Description / Notes")
                 
             if st.button("➕ Add Expense Entry", type="primary"):
                 if exp_amt <= 0:
                     st.error("Please enter a valid expense amount.")
                 else:
-                    new_exp = pd.DataFrame([{
-                        "Date": str(exp_date),
-                        "Expense Category": exp_cat,
-                        "Description": exp_desc,
-                        "Amount": exp_amt
-                    }])
-                    expenses_df = pd.concat([expenses_df, new_exp], ignore_index=True)
-                    save_data_csv(expenses_df, EXPENSES_FILE)
+                    save_record("expenses", {
+                        "date": str(exp_date), "expense_category": exp_cat,
+                        "description": exp_desc, "amount": float(exp_amt)
+                    })
                     st.success("Store Expense Recorded Successfully!")
                     st.rerun()
 
@@ -768,22 +805,14 @@ elif nav_selection == "🔒 Active Device Control":
     else:
         st.subheader("🔒 Active Device & Remote Session Manager")
         if not sessions_df.empty:
-            active_sess = sessions_df[sessions_df["Status"] == "Active"]
-            st.write(f"**Total Active Connected Systems:** `{len(active_sess)}`")
-            st.dataframe(active_sess[["Session ID", "Device Name", "IP Address", "Role", "Login Time", "Status"]], use_container_width=True)
+            active_sess = sessions_df[sessions_df["status"] == "Active"]
+            st.dataframe(active_sess[["session_id", "device_name", "ip_address", "role", "login_time", "status"]], use_container_width=True)
             
-            st.markdown("---")
-            st.subheader("🔴 Terminate / Remote Logout Device")
-            term_id = st.selectbox("Select Active Session ID to Terminate", active_sess["Session ID"].values if not active_sess.empty else ["-- None --"])
-            if term_id != "-- None --":
-                if st.button("🔴 Force Logout Selected Device", type="primary"):
-                    term_idx = sessions_df[sessions_df["Session ID"] == term_id].index[0]
-                    sessions_df.at[term_idx, "Status"] = "Logged Out"
-                    save_data_csv(sessions_df, SESSIONS_FILE)
-                    st.success(f"Device Session {term_id} terminated successfully!")
-                    st.rerun()
-        else:
-            st.info("No session logs recorded yet.")
+            term_id = st.selectbox("Select Session ID to Terminate", active_sess["session_id"].values if not active_sess.empty else ["-- None --"])
+            if term_id != "-- None --" and st.button("🔴 Force Logout Selected Device", type="primary"):
+                update_record("active_sessions", {"status": "Logged Out"}, "session_id", term_id)
+                st.success("Session Terminated!")
+                st.rerun()
 
 # ==================== MODULE: MARKETING TRACKER ====================
 elif nav_selection == "📢 Marketing Tracker":
@@ -797,45 +826,41 @@ elif nav_selection == "📢 Marketing Tracker":
             follow_date = st.date_input("Follow-up Call Date")
             lead_notes = st.text_area("Call Notes / Discussion")
             
-        if st.button("➕ Schedule Follow-up Call"):
-            new_lead = pd.DataFrame([{
-                "Lead ID": f"LEAD-{len(leads_df)+1:04d}", "Customer Name": lead_name,
-                "Mobile": str(lead_mobile), "Followup Date": str(follow_date),
-                "Status": "Pending Followup", "Notes": lead_notes
-            }])
-            leads_df = pd.concat([leads_df, new_lead], ignore_index=True)
-            save_data_csv(leads_df, LEADS_FILE)
-            st.success("Marketing Lead Follow-up Saved!")
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("➕ Schedule Follow-up Call"):
+                if lead_name and lead_mobile:
+                    save_record("marketing_leads", {
+                        "lead_id": f"LEAD-{len(leads_df)+1:04d}", "customer_name": lead_name,
+                        "mobile": str(lead_mobile), "followup_date": str(follow_date),
+                        "status": "Pending Followup", "notes": lead_notes
+                    })
+                    st.success("Follow-up Scheduled!")
+                    st.rerun()
+                    
+        with btn_col2:
+            if st.button("🎯 Converted Successfully", type="primary"):
+                if lead_name and lead_mobile:
+                    save_record("marketing_leads", {
+                        "lead_id": f"LEAD-{len(leads_df)+1:04d}", "customer_name": lead_name,
+                        "mobile": str(lead_mobile), "followup_date": str(today),
+                        "status": "Converted", "notes": lead_notes if lead_notes else "Direct Conversion"
+                    })
+                    st.success("🎉 Client Converted Successfully!")
+                    st.rerun()
 
-    st.markdown("---")
-    st.subheader("⚙️ Update Lead Status (Mark Converted)")
-    if not leads_df.empty:
-        lead_sel = st.selectbox("Select Lead ID to Update", leads_df["Lead ID"].values)
-        lead_row_idx = leads_df[leads_df["Lead ID"] == lead_sel].index[0]
-        
-        status_choice = st.selectbox("Update Status", ["Pending Followup", "Converted", "Rejected"], index=["Pending Followup", "Converted", "Rejected"].index(leads_df.at[lead_row_idx, "Status"]))
-        if st.button("Update Lead Status"):
-            leads_df.at[lead_row_idx, "Status"] = status_choice
-            save_data_csv(leads_df, LEADS_FILE)
-            st.success(f"Lead {lead_sel} updated to {status_choice}!")
-            st.rerun()
-
-    m_disp_df = leads_df.copy()
-    if user_role != "👑 Admin":
-        m_disp_df["Mobile"] = m_disp_df["Mobile"].apply(mask_mobile)
-    st.dataframe(m_disp_df, use_container_width=True)
+    m_disp_df = leads_df.copy() if not leads_df.empty else pd.DataFrame()
+    if not m_disp_df.empty:
+        if user_role != "👑 Admin":
+            m_disp_df["mobile"] = m_disp_df["mobile"].apply(mask_mobile)
+        st.dataframe(m_disp_df, use_container_width=True)
 
 # ==================== MODULE: CONVERTED LEADS ====================
 elif nav_selection == "🎯 Converted Leads":
-    st.subheader("🎯 Marketing Converted Leads (Ready for Booking)")
+    st.subheader("🎯 Marketing Converted Leads")
     if not leads_df.empty:
-        converted_leads = leads_df[leads_df["Status"] == "Converted"].copy()
+        converted_leads = leads_df[leads_df["status"] == "Converted"].copy()
         if not converted_leads.empty:
             if user_role != "👑 Admin":
-                converted_leads["Mobile"] = converted_leads["Mobile"].apply(mask_mobile)
-            st.success(f"Found {len(converted_leads)} successfully converted marketing leads!")
-            st.dataframe(converted_leads[["Lead ID", "Customer Name", "Mobile", "Followup Date", "Notes"]], use_container_width=True)
-        else:
-            st.info("No converted leads found yet.")
-    else:
-        st.info("No marketing lead records found.")
+                converted_leads["mobile"] = converted_leads["mobile"].apply(mask_mobile)
+            st.dataframe(converted_leads[["lead_id", "customer_name", "mobile", "followup_date", "notes"]], use_container_width=True)
