@@ -90,7 +90,7 @@ STORE_UPI_ID = "praveenvp888-2@okaxis"
 MD_MOBILE = "9629373570"          # Managing Director WhatsApp (customer feedback goes here)
 RECEPTION_MOBILE = "8056166017"   # Reception WhatsApp (for corporate pickup alerts)
 DELIVERY_MOBILE = "8056166017"    # Delivery boy WhatsApp (for corporate pickup alerts)
-APP_URL = "https://your-app-name.streamlit.app"   # your deployed Streamlit URL (used in feedback link)
+APP_URL = "https://dry1-crm.streamlit.app"   # your deployed Streamlit URL (used in feedback link)
 DELIVERY_CHARGE_PER_ORDER = 30.0  # ₹ auto-added (internal only) for EVERY delivery order. Change this amount.
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -232,19 +232,19 @@ def _num(v, default=0.0):
 def build_feedback_link(order_id):
     return f"{APP_URL.rstrip('/')}/?feedback={urllib.parse.quote(str(order_id))}"
 
-# ---- GOOGLE REVIEW (simple message sent after delivery) ----
-GOOGLE_REVIEW_URL = "https://share.google/012ttgewhJmJ2inmu"   # your Google review link
-REVIEW_STORE_NAME = "IFB Point Selaiyur"                         # name shown in the review message
+# ---- CUSTOMER REVIEW (own feedback page - reviews are visible ONLY to Admin) ----
+REVIEW_STORE_NAME = "Dry1 Laundry & Saree Care"                  # name shown in the review message
 
 def build_feedback_request_message(order_id=None, customer_name=None):
-    """Simple WhatsApp message asking the customer for a 5-star Google review."""
+    """WhatsApp message sent after delivery. Link opens our own feedback form; submitted reviews appear only on the Admin page."""
+    name = str(customer_name).strip() if customer_name else "Customer"
     return (
-        "Dear Customer,\n\n"
+        f"Dear {name},\n\n"
         f"Thank you for choosing {REVIEW_STORE_NAME}.\n\n"
-        "We hope you are happy with your purchase and our service. "
-        "Your feedback means a lot to us. "
-        "Kindly spare a minute to rate us with 5 stars if you had a great experience.\n\n"
-        f"⭐ Leave your review here: {GOOGLE_REVIEW_URL}\n\n"
+        "We hope you are happy with our service. "
+        "Kindly spare a minute to rate your experience with us.\n\n"
+        f"⭐ Rate us here: {build_feedback_link(order_id)}\n\n"
+        "Your feedback helps us serve you better.\n\n"
         "Thank you for your support.\n\n"
         f"{REVIEW_STORE_NAME}"
     )
@@ -286,10 +286,7 @@ def render_feedback_page(order_id):
 
         if st.session_state.get(done_key):
             d = st.session_state[done_key]
-            st.success("🙏 Thank you! Your feedback has been submitted.")
-            st.info("👇 Tap below to send your feedback directly to our Managing Director on WhatsApp.")
-            md_msg = build_feedback_to_md_message(order_id, cust, d["overall"], d["quality"], d["delivery"], d["comments"])
-            st.markdown(f'<a href="{build_wa_url(MD_MOBILE, md_msg)}" target="_blank" class="wa-link-btn">📲 Send to Managing Director on WhatsApp</a>', unsafe_allow_html=True)
+            st.success("🙏 Thank you! Your feedback has been submitted. We truly appreciate it.")
             return
 
         existing = load_data("customer_feedback")
@@ -298,7 +295,7 @@ def render_feedback_page(order_id):
             return
 
         st.markdown(f"Dear **{cust}**, thank you for choosing us! Order: `{order_id}`")
-        st.info("🔒 Your feedback goes directly to our **Managing Director** on WhatsApp.")
+        st.info("🔒 Your feedback is private and is seen only by our management team.")
         with st.form("customer_feedback_form"):
             overall = st.radio("Overall Experience", STAR_OPTIONS, index=4, horizontal=True)
             quality = st.radio("Cleaning / Ironing Quality", STAR_OPTIONS, index=4, horizontal=True)
@@ -1346,6 +1343,8 @@ elif nav_selection == "⭐ Customer Feedback":
         st.error("🔒 Access Restricted to Admin Only.")
     else:
         st.subheader("⭐ Customer Feedback Received")
+        if "your-app-name" in APP_URL:
+            st.warning("⚠️ APP_URL in app.py is still the sample link. Put your real online app URL there, otherwise the feedback link sent to customers will not open.")
         fb_df = load_data("customer_feedback")
         if fb_df.empty:
             st.info("No feedback received yet.")
@@ -1358,7 +1357,34 @@ elif nav_selection == "⭐ Customer Feedback":
             low = fb_df[pd.to_numeric(fb_df["overall_rating"], errors="coerce") <= 2]
             if not low.empty:
                 st.markdown(f'<div class="alert-red">🚨 {len(low)} low-rating feedback(s) (2★ or below) need attention!</div>', unsafe_allow_html=True)
-            st.dataframe(fb_df.sort_values("submitted_at", ascending=False), use_container_width=True)
+            fb_df = fb_df.copy()
+            for _c in ["overall_rating", "quality_rating", "delivery_rating"]:
+                fb_df[_c] = pd.to_numeric(fb_df[_c], errors="coerce").fillna(0).astype(int)
+            fb_df = fb_df.sort_values("submitted_at", ascending=False)
+
+            rating_filter = st.radio("🔍 Filter by Overall Rating:", ["All", "5★", "4★", "3★", "2★ & below"], horizontal=True)
+            if rating_filter == "2★ & below":
+                fb_view = fb_df[fb_df["overall_rating"] <= 2]
+            elif rating_filter != "All":
+                fb_view = fb_df[fb_df["overall_rating"] == int(rating_filter[0])]
+            else:
+                fb_view = fb_df
+
+            for _, r in fb_view.iterrows():
+                border = "#DC2626" if r["overall_rating"] <= 2 else ("#F59E0B" if r["overall_rating"] == 3 else "#22C55E")
+                cmt = html_lib.escape(str(r.get("comments") or "").strip()) or "<i>No comments</i>"
+                st.markdown(
+                    f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-left:6px solid {border};border-radius:12px;padding:14px 16px;margin-bottom:10px;">'
+                    f'<div style="display:flex;justify-content:space-between;flex-wrap:wrap;">'
+                    f'<b style="color:#0F172A;">{html_lib.escape(str(r["customer_name"]))}</b>'
+                    f'<span style="color:#64748B;font-size:0.8rem;">{html_lib.escape(str(r["order_id"]))} • {html_lib.escape(str(r["submitted_at"]))}</span></div>'
+                    f'<div style="margin:6px 0;color:#0F172A;">Overall {"⭐" * r["overall_rating"]} &nbsp; Quality {"⭐" * r["quality_rating"]} &nbsp; Delivery {"⭐" * r["delivery_rating"]}</div>'
+                    f'<div style="color:#334155;">💬 {cmt}</div></div>',
+                    unsafe_allow_html=True)
+            if fb_view.empty:
+                st.info("No feedback for this filter.")
+            with st.expander("📋 View as Table"):
+                st.dataframe(fb_df, use_container_width=True)
 
 # ==================== MODULE: BILLING (RECEPTION ONLY) ====================
 elif nav_selection == "📝 New Billing & Order":
