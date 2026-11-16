@@ -7,7 +7,16 @@ import random
 import smtplib
 import urllib.parse
 import html as html_lib
-from datetime import datetime, timedelta
+import base64
+import json
+import time as _time
+import sys
+import subprocess
+import re
+import hashlib
+import zipfile
+from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 
 # Page Configuration
@@ -55,6 +64,29 @@ def update_record(table_name, record_dict, match_col, match_val):
         st.error(f"Database Update Error: {e}")
         return False
 
+def upsert_customer(mobile, name, cust_type, order_total, notes=""):
+    """New mobile -> creates the customer. Returning mobile -> updates total_orders / total_spent (no duplicate error)."""
+    mobile = str(mobile).strip()
+    try:
+        res = supabase.table("customers").select("*").eq("mobile", mobile).execute()
+        if res.data:
+            old = res.data[0]
+            supabase.table("customers").update({
+                "name": name, "type": cust_type,
+                "total_orders": int(float(old.get("total_orders") or 0)) + 1,
+                "total_spent": float(old.get("total_spent") or 0) + float(order_total),
+            }).eq("mobile", mobile).execute()
+        else:
+            supabase.table("customers").insert({
+                "mobile": mobile, "name": name, "type": cust_type,
+                "total_orders": 1, "total_spent": float(order_total), "notes": notes
+            }).execute()
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        st.error(f"Customer Save Error: {e}")
+        return False
+
 def delete_record(table_name, match_col, match_val):
     try:
         supabase.table(table_name).delete().eq(match_col, match_val).execute()
@@ -79,6 +111,234 @@ def send_email_otp(target_email, otp_code):
         return True
     except Exception:
         return False
+
+# ---------------- CALLYZER (call tracking) INTEGRATION ----------------
+CALLYZER_API_VERSION = "v2.2"
+CALLYZER_BASES = {
+    "Production": f"https://api1.callyzer.co/api/{CALLYZER_API_VERSION}",
+    "Sandbox": f"https://sandbox.api.callyzer.co/api/{CALLYZER_API_VERSION}",
+}
+IST = timezone(timedelta(hours=5, minutes=30))
+_CZ_LAST_CALL = {"t": 0.0}
+CALL_TYPE_ICON = {"Incoming": "📥 Incoming", "Outgoing": "📤 Outgoing", "Missed": "❌ Missed", "Rejected": "🚫 Rejected"}
+
+def get_app_setting(key, default=""):
+    """Reads a value from the app_settings table. Returns None when the table does not exist."""
+    try:
+        res = supabase.table("app_settings").select("setting_value").eq("setting_key", key).execute()
+        if res.data:
+            return res.data[0].get("setting_value") or default
+        return default
+    except Exception:
+        return None
+
+def set_app_setting(key, value):
+    try:
+        supabase.table("app_settings").upsert({"setting_key": key, "setting_value": str(value)}).execute()
+        return True
+    except Exception as e:
+        st.error(f"Settings Save Error: {e}")
+        return False
+
+def callyzer_post(api_key, base, path, body, timeout=40):
+    """POST to Callyzer. Obeys the 1-request-per-2-seconds limit. Returns (ok, json_or_error_text)."""
+    import urllib.request, urllib.error
+    url = base.rstrip("/") + path
+    payload = json.dumps(body).encode("utf-8")
+    for attempt in range(3):
+        wait = 2.1 - (_time.time() - _CZ_LAST_CALL["t"])
+        if wait > 0:
+            _time.sleep(wait)
+        _CZ_LAST_CALL["t"] = _time.time()
+        req = urllib.request.Request(url, data=payload, method="POST", headers={
+            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return True, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                _time.sleep(3)
+                continue
+            try:
+                msg = json.loads(e.read().decode("utf-8")).get("message")
+            except Exception:
+                msg = None
+            return False, f"HTTP {e.code}: {msg or e.reason}"
+        except Exception as e:
+            return False, str(e)
+    return False, "Too many requests (rate limit). Please try again in a few seconds."
+
+def cz_range_body(d1, d2):
+    start = datetime.combine(d1, datetime.min.time(), tzinfo=IST)
+    end = datetime.combine(d2, datetime.max.time().replace(microsecond=0), tzinfo=IST)
+    return {"call_from": int(start.timestamp()), "call_to": int(end.timestamp()),
+            "call_method": "PhoneCall", "call_mode": "Voice"}
+
+def _cz_list(result, *keys):
+    """Callyzer returns either a list or {key: list}. Always gives a list back."""
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for k in keys:
+            if isinstance(result.get(k), list):
+                return result[k]
+        for v in result.values():
+            if isinstance(v, list):
+                return v
+    return []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cz_fetch_all(api_key, base, d1_iso, d2_iso):
+    """Summary + staff report + latest calls + follow-up lists for the date range (cached 5 min)."""
+    d1 = datetime.strptime(d1_iso, "%Y-%m-%d").date()
+    d2 = datetime.strptime(d2_iso, "%Y-%m-%d").date()
+    body = cz_range_body(d1, d2)
+    out = {"summary": {}, "employees": [], "history": [], "never": [], "notpick": [], "errors": [], "fatal": False}
+
+    ok, data = callyzer_post(api_key, base, "/call-log/summary", body)
+    if not ok:
+        out["errors"].append(("Summary", data))
+        out["fatal"] = True
+        return out
+    out["summary"] = (data or {}).get("result") or {}
+
+    ok, data = callyzer_post(api_key, base, "/call-log/employee-summary", {**body, "page_no": 1, "page_size": 100})
+    if ok:
+        out["employees"] = _cz_list((data or {}).get("result"), "employees")
+    else:
+        out["errors"].append(("Staff report", data))
+
+    ok, data = callyzer_post(api_key, base, "/call-log/history", {**body, "page_no": 1, "page_size": 100})
+    if ok:
+        out["history"] = _cz_list((data or {}).get("result"), "call_logs", "call_history", "calls", "logs")
+    else:
+        out["errors"].append(("Call history", data))
+
+    ok, data = callyzer_post(api_key, base, "/call-log/never-attended", {**body, "page_no": 1, "page_size": 100})
+    if ok:
+        out["never"] = _cz_list((data or {}).get("result"))
+    else:
+        out["errors"].append(("Never attended", data))
+
+    ok, data = callyzer_post(api_key, base, "/call-log/not-pickup-by-client", {**body, "page_no": 1, "page_size": 100})
+    if ok:
+        out["notpick"] = _cz_list((data or {}).get("result"))
+    else:
+        out["errors"].append(("Not picked by client", data))
+    return out
+
+def cz_fmt_secs(sec):
+    sec = int(_num(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+def cz_kpi(icon, label, value, c1, c2):
+    return (f'<div style="background:linear-gradient(135deg,{c1},{c2});border-radius:16px;padding:16px 18px;color:#FFFFFF;'
+            f'box-shadow:0 8px 20px rgba(15,23,42,0.14);">'
+            f'<div style="font-size:1.25rem;">{icon}</div>'
+            f'<div style="font-size:1.75rem;font-weight:800;line-height:1.25;">{value}</div>'
+            f'<div style="font-size:0.78rem;opacity:0.92;font-weight:700;letter-spacing:0.3px;">{label}</div></div>')
+
+def cz_client_number(row):
+    code = str(row.get("client_country_code") or "91")
+    return f"{code}{clean_mobile(row.get('client_number', ''))}"
+
+def cz_followup_card(name, number, when, staff, kind_color):
+    wa = build_wa_url(number, f"Hello {name}, this is {REVIEW_STORE_NAME}. We noticed a call from you. How can we help you?")
+    return (f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-left:6px solid {kind_color};border-radius:14px;'
+            f'padding:12px 16px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
+            f'<div><div style="font-weight:800;color:#0F172A;">{html_lib.escape(str(name))}</div>'
+            f'<div style="color:#64748B;font-size:0.82rem;">📞 {html_lib.escape(clean_mobile(number))} • 🕒 {html_lib.escape(str(when))} • 👤 {html_lib.escape(str(staff))}</div></div>'
+            f'<div style="display:flex;gap:8px;">'
+            f'<a href="tel:+91{clean_mobile(number)}" style="background:#2563EB;color:#fff !important;padding:7px 14px;border-radius:10px;font-weight:700;font-size:0.8rem;text-decoration:none;">📞 Call</a>'
+            f'<a href="{wa}" target="_blank" style="background:#22C55E;color:#fff !important;padding:7px 14px;border-radius:10px;font-weight:700;font-size:0.8rem;text-decoration:none;">💬 WhatsApp</a>'
+            f'</div></div>')
+
+# --- AUTO DATA BACKUP (every 5 days -> email) ---
+BACKUP_EMAIL = "praveenvp888@gmail.com"      # backups are emailed here
+BACKUP_INTERVAL_DAYS = 5
+BACKUP_TABLES = [
+    "orders", "customers", "expenses", "vendor_purchases", "delivery_shift_logs", "shift_handover",
+    "corporate_clients", "corporate_pickups", "customer_feedback", "marketing_leads",
+    "staff_advances", "staff_salary_payments", "bill_confirmations",
+]
+
+def build_backup_zip():
+    """Reads every table and returns (zip_bytes, {table: rows}). Each table becomes one CSV file inside the ZIP."""
+    buf = io.BytesIO()
+    summary = {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for t in BACKUP_TABLES:
+            df = load_data(t)
+            summary[t] = int(len(df))
+            if not df.empty:
+                zf.writestr(f"{t}.csv", df.to_csv(index=False).encode("utf-8-sig"))
+    return buf.getvalue(), summary
+
+def send_backup_email(zip_bytes, summary, run_date):
+    """Emails the backup ZIP. Returns (True, '') or (False, error_text)."""
+    try:
+        msg = EmailMessage()
+        msg["From"] = GMAIL_SENDER
+        msg["To"] = BACKUP_EMAIL
+        msg["Subject"] = f"💾 Dry1 CRM Data Backup — {run_date.strftime('%d %b %Y')}"
+        lines = "\n".join(f"  • {t}: {n} rows" for t, n in summary.items())
+        msg.set_content(
+            f"Hello,\n\nAutomatic data backup of Dry1 Laundry & Saree Care CRM ({run_date.strftime('%d %b %Y')}).\n"
+            f"The attached ZIP has one CSV file per table (open with Excel).\n\n{lines}\n\n"
+            "Keep this email safe - it contains customer and business data.\n\nRegards,\nDry1 CRM"
+        )
+        msg.add_attachment(zip_bytes, maintype="application", subtype="zip",
+                           filename=f"Dry1_Backup_{run_date.strftime('%Y-%m-%d')}.zip")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def get_backup_log():
+    """Returns the backup_log DataFrame, or None when the table does not exist / cannot be read."""
+    try:
+        res = supabase.table("backup_log").select("*").execute()
+        return pd.DataFrame(res.data)
+    except Exception:
+        return None
+
+def last_backup_date(log_df):
+    if log_df is None or log_df.empty or "backup_date" not in log_df.columns:
+        return None
+    ok = log_df[log_df["status"].astype(str) == "Sent"] if "status" in log_df.columns else log_df
+    dates = pd.to_datetime(ok["backup_date"], errors="coerce").dropna()
+    return dates.max().date() if not dates.empty else None
+
+def run_backup(run_date, trigger="Auto"):
+    """Builds + emails a backup and writes a log row. Returns (ok, message, zip_bytes)."""
+    zip_bytes, summary = build_backup_zip()
+    ok, err = send_backup_email(zip_bytes, summary, run_date)
+    if ok:
+        try:
+            supabase.table("backup_log").insert({
+                "backup_date": str(run_date), "status": "Sent", "trigger_type": trigger,
+                "tables_count": len(summary), "rows_count": int(sum(summary.values())),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }).execute()
+        except Exception:
+            pass
+        return True, f"Backup emailed to {BACKUP_EMAIL}", zip_bytes
+    return False, f"Backup email failed: {err}", zip_bytes
+
+def auto_backup_if_due(run_date):
+    """Runs once per login session: if the last backup is 5+ days old, emails a new one."""
+    log_df = get_backup_log()
+    if log_df is None:
+        return "no_table"
+    last = last_backup_date(log_df)
+    if last is not None and (run_date - last).days < BACKUP_INTERVAL_DAYS:
+        return "not_due"
+    ok, msg, _ = run_backup(run_date, "Auto")
+    return "sent" if ok else msg
 
 # --- HELPER FUNCTIONS & CONFIG ---
 ADMIN_MOBILE = "9629373570"        # Admin WhatsApp / customer support number (+91 96293 73570)
@@ -140,12 +400,24 @@ def fmt_date(d):
 def _wa_header(title):
     return [WA_LINE, f"💧 *{STORE_NAME}*", f"_{STORE_TAGLINE}_", WA_LINE, "", title, ""]
 
+# ---- PUBLIC BILL LINK (sent in the WhatsApp receipt; opens the bill with logo + PDF download) ----
+BILL_LINK_SECRET = "Dry1-Bill-Link-2026"   # change to any private text; it keeps bill links un-guessable
+
+def bill_token(order_id):
+    return hashlib.sha256(f"{order_id}|{BILL_LINK_SECRET}".encode()).hexdigest()[:10]
+
+def build_bill_link(order_id):
+    return f"{_link_base()}/?bill={urllib.parse.quote(str(order_id))}&t={bill_token(order_id)}"
+
 def build_receipt_message(order_id, customer_name, service, items, weight_kg,
-                          total, paid, balance, promised_date, order_type="Walk-in"):
+                          total, paid, balance, promised_date, order_type="Walk-in",
+                          corporate=False, next_pickup=None, notes=None):
     """Professional WhatsApp order receipt."""
     total, paid, balance = float(total), float(paid), float(balance)
     is_paid = balance <= 0
     type_txt = "Doorstep Pickup & Delivery" if order_type == "Delivery" else "Walk-in"
+    if corporate:
+        type_txt = "Corporate Pickup & Delivery"
 
     details = [
         f"Order ID : {order_id}",
@@ -157,6 +429,10 @@ def build_receipt_message(order_id, customer_name, service, items, weight_kg,
     if weight_kg and float(weight_kg) > 0:
         details.append(f"Weight   : {float(weight_kg)} KG")
     details.append(f"Ready By : {fmt_date(promised_date)}")
+    if next_pickup:
+        details.append(f"Next Pickup : {fmt_date(next_pickup)}")
+    if notes:
+        details.append(f"Notes    : {notes}")
 
     payment = [
         f"Total Amount : ₹{total:,.2f}",
@@ -179,6 +455,11 @@ def build_receipt_message(order_id, customer_name, service, items, weight_kg,
     ]
     if not is_paid:
         lines += [f"Pay via UPI: *{STORE_UPI_ID}*"]
+    lines += [
+        "",
+        "🔗 *Check your bill, confirm & download PDF:*",
+        build_bill_link(order_id),
+    ]
     lines += [
         "",
         WA_LINE,
@@ -229,8 +510,15 @@ def _num(v, default=0.0):
         return default
 
 # ---------------- FEEDBACK (goes to Managing Director) ----------------
+# Optional: public "share page" (GitHub Pages) whose WhatsApp preview card shows the Dry1 LOGO.
+# Leave "" to use the Streamlit link directly. Example: "https://yourname.github.io/dry1-share"
+SHARE_PAGE_URL = "https://kavin411.github.io/dry1share"
+
+def _link_base():
+    return (SHARE_PAGE_URL or APP_URL).rstrip("/")
+
 def build_feedback_link(order_id):
-    return f"{APP_URL.rstrip('/')}/?feedback={urllib.parse.quote(str(order_id))}"
+    return f"{_link_base()}/?feedback={urllib.parse.quote(str(order_id))}"
 
 # ---- CUSTOMER REVIEW (own feedback page - reviews are visible ONLY to Admin) ----
 REVIEW_STORE_NAME = "Dry1 Laundry & Saree Care"                  # name shown in the review message
@@ -348,6 +636,49 @@ def _priority_rank(p):
     p = str(p)
     return 0 if "Urgent" in p else (1 if "High" in p else 2)
 
+def render_service_ticks(key_prefix):
+    """Tick-box list of services. Tick ONE or MORE services - they are combined in the same bill."""
+    st.markdown("**🧼 Services Offered** _(tick one or more)_")
+    cols = st.columns(2)
+    chosen = []
+    for i, svc in enumerate(SERVICES_LIST):
+        with cols[i % 2]:
+            if st.checkbox(svc, key=f"{key_prefix}_svc_{i}"):
+                chosen.append(svc)
+    if chosen:
+        st.caption("✅ Selected: " + " + ".join(chosen))
+    return chosen
+
+GARMENT_TYPES = ["Shirt", "Pant", "T-Shirt", "Saree", "Blouse", "Kurta", "Churidar",
+                  "Jacket / Coat", "Suit", "Blanket", "Bedsheet", "Towel", "Others"]
+
+def render_garment_notes(key_prefix):
+    """Notes box: how many Shirt / Pant / Saree ... + free text. Returns (garment_total, notes_text)."""
+    counts = {}
+    with st.expander("📝 Notes — Garment Count (Shirt / Pant / Saree ...)", expanded=False):
+        gcols = st.columns(3)
+        for i, g in enumerate(GARMENT_TYPES):
+            with gcols[i % 3]:
+                n = st.number_input(g, min_value=0, step=1, value=0, key=f"{key_prefix}_g_{i}")
+                if n > 0:
+                    counts[g] = int(n)
+        extra = st.text_area("Extra Notes (stains, special care, etc.)", key=f"{key_prefix}_gnote", height=80)
+    total = sum(counts.values())
+    parts = ", ".join(f"{g} x{n}" for g, n in counts.items())
+    note_text = " | ".join(x for x in [parts, " ".join(extra.split())] if x)
+    if total > 0:
+        st.caption(f"🧮 Garments total: **{total}** (used as Items Count) — {parts}")
+    return total, note_text
+
+def next_pickup_date(client_row, from_date):
+    """Next scheduled weekly pickup date (after from_date) for a registered corporate client."""
+    days = [d.strip() for d in str(client_row.get("pickup_days", "")).split(",") if d.strip()]
+    for i in range(1, 8):
+        d = from_date + timedelta(days=i)
+        if WEEKDAYS[d.weekday()] in days:
+            return d
+    return from_date + timedelta(days=2)
+
 # ---------------- CORPORATE PICKUP SCHEDULE & ALERTS ----------------
 def get_corporate_alerts(clients_df, pickups_df, today, lookback=7):
     """Every scheduled pickup day (today or up to `lookback` days back) that is not yet marked 'Picked Up'."""
@@ -411,11 +742,327 @@ def render_corporate_alerts(alerts, user_role):
                                     (b3, "Admin", ADMIN_MOBILE, "#DC2626")]:
             col.markdown(f'<a href="{build_wa_url(num, msg)}" target="_blank" class="wa-link-btn" style="background:{bg} !important;">📲 Alert {label}</a>', unsafe_allow_html=True)
 
+# ---------------- BILL LOGO + PDF ----------------
+LOGO_CANDIDATES = ["Dry1_Logo.png", "logo.webp", "logo.png"]   # keep the logo file in the same folder as app.py
+
+@st.cache_resource
+def get_logo_png():
+    """Returns the shop logo as PNG bytes (resized) or None when the file is missing."""
+    base_dirs = []
+    try:
+        base_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    base_dirs.append(os.getcwd())
+    for d in base_dirs:
+        for name in LOGO_CANDIDATES:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                try:
+                    from PIL import Image
+                    img = Image.open(path).convert("RGBA")
+                    img.thumbnail((500, 500))
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    return buf.getvalue()
+                except Exception:
+                    continue
+    return None
+
+def logo_data_uri():
+    b = get_logo_png()
+    return ("data:image/png;base64," + base64.b64encode(b).decode()) if b else None
+
+def _pdf_fonts():
+    """Pick a TTF font that has the rupee symbol; fall back to Helvetica with 'Rs.'."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    pairs = [
+        ("C:/Windows/Fonts/Nirmala.ttf", "C:/Windows/Fonts/NirmalaB.ttf"),
+        ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+    ]
+    for reg, bold in pairs:
+        if os.path.exists(reg) and os.path.exists(bold):
+            try:
+                pdfmetrics.registerFont(TTFont("BillFont", reg))
+                pdfmetrics.registerFont(TTFont("BillFont-Bold", bold))
+                return "BillFont", "BillFont-Bold", "\u20b9"
+            except Exception:
+                continue
+    return "Helvetica", "Helvetica-Bold", "Rs. "
+
+_PDF_LIBS_TRIED = {"done": False, "ok": False}
+
+def ensure_pdf_libs():
+    """Makes sure reportlab + pillow exist. On the desktop (python) it installs them automatically once."""
+    try:
+        import reportlab, PIL  # noqa
+        return True
+    except ImportError:
+        pass
+    if _PDF_LIBS_TRIED["done"]:
+        return _PDF_LIBS_TRIED["ok"]
+    _PDF_LIBS_TRIED["done"] = True
+    if getattr(sys, "frozen", False):          # inside a built .exe pip cannot be used
+        return False
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab", "pillow", "--quiet"], timeout=240)
+        import importlib
+        importlib.invalidate_caches()
+        import reportlab, PIL  # noqa
+        _PDF_LIBS_TRIED["ok"] = True
+        return True
+    except Exception:
+        return False
+
+def bill_download_button(bill, mob_disp, key):
+    """PDF download; if the PDF module is missing, falls back to a printable HTML bill so it never fails."""
+    try:
+        if not ensure_pdf_libs():
+            raise ImportError("reportlab not installed")
+        pdf_bytes = build_bill_pdf(bill, mob_disp)
+        st.download_button("📄 Download Bill as PDF", data=pdf_bytes,
+                           file_name=f"{bill['order_id']}_bill.pdf", mime="application/pdf", key=key)
+    except Exception:
+        st.download_button("🖨️ Download Bill (open it, then Print / Save as PDF)",
+                           data=build_bill_download_html(bill, mob_disp).encode("utf-8"),
+                           file_name=f"{bill['order_id']}_bill.html", mime="text/html", key=key + "_html")
+        st.caption("PDF module missing. In terminal run:  pip install reportlab pillow  and restart the app.")
+
+def build_bill_pdf(b, mobile_display):
+    """Real PDF invoice (A5) with logo, order details and payment summary. Returns PDF bytes."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A5
+    from reportlab.lib.utils import ImageReader, simpleSplit
+    from reportlab.lib.colors import HexColor, white
+
+    F, FB, SYM = _pdf_fonts()
+    W, H = A5
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A5)
+    c.setTitle(f"Bill {b['order_id']}")
+    M = 28                      # side margin
+    y = H - 24
+
+    # ---- logo ----
+    logo = get_logo_png()
+    if logo:
+        try:
+            img = ImageReader(io.BytesIO(logo))
+            iw, ih = img.getSize()
+            scale = min(190 / iw, 62 / ih)
+            lw, lh = iw * scale, ih * scale
+            c.drawImage(img, (W - lw) / 2, y - lh, width=lw, height=lh, mask="auto")
+            y -= lh + 10
+        except Exception:
+            pass
+
+    # ---- blue header band ----
+    band_h = 62
+    c.setFillColor(HexColor("#2563EB"))
+    c.roundRect(M - 8, y - band_h, W - 2 * M + 16, band_h, 10, fill=1, stroke=0)
+    c.setFillColor(white)
+    c.setFont(FB, 14)
+    c.drawCentredString(W / 2, y - 20, STORE_NAME)
+    c.setFont(F, 8)
+    c.drawCentredString(W / 2, y - 33, STORE_TAGLINE)
+    c.setFillColor(HexColor("#1E40AF"))
+    c.roundRect(W / 2 - 45, y - 56, 90, 15, 7, fill=1, stroke=0)
+    c.setFillColor(white)
+    c.setFont(FB, 8)
+    c.drawCentredString(W / 2, y - 51.5, "ORDER RECEIPT")
+    y -= band_h + 14
+
+    # ---- order id / date box ----
+    c.setFillColor(HexColor("#F1F5F9"))
+    c.roundRect(M, y - 34, W - 2 * M, 34, 8, fill=1, stroke=0)
+    c.setFillColor(HexColor("#64748B")); c.setFont(FB, 7)
+    c.drawString(M + 10, y - 12, "ORDER ID"); c.drawRightString(W - M - 10, y - 12, "DATE")
+    c.setFillColor(HexColor("#0F172A")); c.setFont(FB, 11)
+    c.drawString(M + 10, y - 27, str(b["order_id"]))
+    c.drawRightString(W - M - 10, y - 27, datetime.now().strftime("%d %b %Y"))
+    y -= 50
+
+    # ---- billed to ----
+    c.setFillColor(HexColor("#64748B")); c.setFont(FB, 7)
+    c.drawString(M, y, "BILLED TO"); y -= 14
+    c.setFillColor(HexColor("#0F172A")); c.setFont(FB, 12)
+    c.drawString(M, y, str(b["customer_name"])[:45]); y -= 13
+    c.setFillColor(HexColor("#475569")); c.setFont(F, 9)
+    c.drawString(M, y, f"Mobile: {mobile_display}"); y -= 16
+
+    # ---- detail rows ----
+    type_txt = "Doorstep Pickup & Delivery" if b["order_type"] == "Delivery" else "Walk-in"
+    if b.get("corporate"):
+        type_txt = "Corporate Pickup & Delivery"
+    rows = [("Service", str(b["service"])), ("Items", f"{int(b['items'])} pcs")]
+    if b.get("weight_kg") and float(b["weight_kg"]) > 0:
+        rows.append(("Weight", f"{float(b['weight_kg'])} KG"))
+    rows += [("Order Type", type_txt), ("Ready By", fmt_date(b["promised_date"]))]
+    if b.get("next_pickup"):
+        rows.append(("Next Pickup", fmt_date(b["next_pickup"])))
+    if b.get("notes"):
+        rows.append(("Notes", str(b["notes"])))
+    for k, v in rows:
+        lines = simpleSplit(v, FB, 9, W - 2 * M - 90)
+        c.setFillColor(HexColor("#64748B")); c.setFont(F, 9)
+        c.drawString(M, y, k)
+        c.setFillColor(HexColor("#0F172A")); c.setFont(FB, 9)
+        for i, ln in enumerate(lines):
+            c.drawRightString(W - M, y - i * 11, ln)
+        y -= max(1, len(lines)) * 11 + 3
+        c.setStrokeColor(HexColor("#E2E8F0")); c.setDash(2, 2); c.line(M, y + 5, W - M, y + 5); c.setDash()
+        y -= 6
+    y -= 4
+
+    # ---- payment box ----
+    total, paid, bal = float(b["total"]), float(b["paid"]), float(b["balance"])
+    is_paid = bal <= 0
+    box_h = 66
+    c.setFillColor(HexColor("#F1F5F9"))
+    c.roundRect(M, y - box_h, W - 2 * M, box_h, 8, fill=1, stroke=0)
+    c.setFillColor(HexColor("#64748B")); c.setFont(F, 9)
+    c.drawString(M + 10, y - 16, "Total Amount"); c.drawString(M + 10, y - 31, "Amount Paid")
+    c.setFillColor(HexColor("#0F172A")); c.setFont(FB, 9)
+    c.drawRightString(W - M - 10, y - 16, f"{SYM}{total:,.2f}")
+    c.setFillColor(HexColor("#16A34A"))
+    c.drawRightString(W - M - 10, y - 31, f"{SYM}{paid:,.2f}")
+    c.setStrokeColor(HexColor("#CBD5E1")); c.line(M + 10, y - 40, W - M - 10, y - 40)
+    c.setFillColor(HexColor("#0F172A")); c.setFont(FB, 11)
+    c.drawString(M + 10, y - 56, "Balance Due")
+    c.setFillColor(HexColor("#DC2626"))
+    c.drawRightString(W - M - 10, y - 56, f"{SYM}{bal:,.2f}")
+    y -= box_h + 18
+
+    # ---- status badge ----
+    badge_txt = "PAID IN FULL" if is_paid else "PAYMENT PENDING"
+    c.setFillColor(HexColor("#DCFCE7" if is_paid else "#FEF3C7"))
+    c.roundRect(W / 2 - 62, y - 8, 124, 20, 10, fill=1, stroke=0)
+    c.setFillColor(HexColor("#166534" if is_paid else "#92400E")); c.setFont(FB, 9)
+    c.drawCentredString(W / 2, y - 1.5, badge_txt)
+    y -= 24
+    if not is_paid:
+        c.setFillColor(HexColor("#475569")); c.setFont(F, 8)
+        c.drawCentredString(W / 2, y, f"Pay via UPI: {STORE_UPI_ID}")
+        y -= 12
+
+    # ---- footer ----
+    c.setStrokeColor(HexColor("#E2E8F0")); c.line(M, 52, W - M, 52)
+    c.setFillColor(HexColor("#64748B")); c.setFont(F, 8)
+    c.drawCentredString(W / 2, 40, "Please keep this receipt for order collection.")
+    c.drawCentredString(W / 2, 29, f"Support: {STORE_CONTACT}")
+    c.setFillColor(HexColor("#0F172A")); c.setFont(FB, 9)
+    c.drawCentredString(W / 2, 16, "Thank you for choosing Dry1!")
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+def get_bill_confirmations():
+    """Returns bill_confirmations DataFrame, or None if the table does not exist."""
+    try:
+        res = supabase.table("bill_confirmations").select("*").execute()
+        return pd.DataFrame(res.data)
+    except Exception:
+        return None
+
+def latest_confirmation(conf_df, order_id):
+    """Latest customer response for an order -> (status, comment, time) or None."""
+    if conf_df is None or conf_df.empty or "order_id" not in conf_df.columns:
+        return None
+    m = conf_df[conf_df["order_id"] == order_id]
+    if m.empty:
+        return None
+    r = m.sort_values("confirmed_at").iloc[-1]
+    return str(r.get("status", "")), str(r.get("comment") or ""), str(r.get("confirmed_at", ""))
+
+def confirmation_label(conf_df, order_id):
+    """Short text for the Operations table."""
+    if conf_df is None:
+        return "-"
+    lc = latest_confirmation(conf_df, order_id)
+    if lc is None:
+        return "⏳ Pending"
+    if lc[0] == "Confirmed":
+        return "✅ Confirmed"
+    return f"⚠️ Issue: {lc[1][:40]}"
+
+def render_public_bill_page(order_id, token):
+    """Public page opened from the WhatsApp bill link (no login). Shows the bill with logo + PDF download."""
+    row = None
+    if token == bill_token(order_id):
+        orders = load_data("orders")
+        if not orders.empty and "order_id" in orders.columns:
+            m = orders[orders["order_id"] == order_id]
+            if not m.empty:
+                row = m.iloc[0]
+    _, c, _ = st.columns([1, 1.6, 1])
+    with c:
+        if row is None:
+            st.error("❌ This bill link is invalid or the bill was not found. Please contact the store.")
+            return
+        instr = str(row.get("special_instructions") or "")
+        nxt = re.search(r"Next Pickup: (\d{4}-\d{2}-\d{2})", instr)
+        bill = {
+            "order_id": str(row["order_id"]), "customer_name": str(row["customer_name"]),
+            "mobile": str(row["mobile"]), "service": str(row["service"]),
+            "items": int(float(row.get("items_count") or 1)), "weight_kg": float(row.get("weight_kg") or 0),
+            "total": float(row.get("total_amount") or 0), "paid": float(row.get("paid_amount") or 0),
+            "balance": float(row.get("balance_amount") or 0), "promised_date": str(row["promised_date"]),
+            "order_type": str(row.get("customer_type") or "Walk-in"),
+            "corporate": instr.startswith("Corporate"), "next_pickup": nxt.group(1) if nxt else None,
+            "notes": (re.search(r"Notes: (.*)$", instr).group(1) if re.search(r"Notes: (.*)$", instr) else None),
+        }
+        mob = mask_mobile(bill["mobile"])
+        st.markdown(build_bill_card_html(bill, mob), unsafe_allow_html=True)
+        st.caption(f"📦 Order Status: {row.get('order_status', '')}")
+        bill_download_button(bill, mob, "public_bill_dl")
+
+        # ---- customer verification ----
+        conf_df = get_bill_confirmations()
+        if conf_df is not None:
+            st.markdown("---")
+            lc = latest_confirmation(conf_df, bill["order_id"])
+            if lc and lc[0] == "Confirmed":
+                st.success(f"✅ You confirmed this bill on {lc[2]}. Thank you!")
+            else:
+                if lc and lc[0] == "Issue":
+                    st.warning("⚠️ You reported a problem with this bill. Our team will contact you shortly.")
+                st.markdown("##### Is everything correct?")
+                st.caption("Please check the services, items, notes and amount above.")
+                if st.button("✅ Yes, everything is correct", type="primary", key="pub_confirm"):
+                    try:
+                        supabase.table("bill_confirmations").insert({
+                            "order_id": bill["order_id"], "status": "Confirmed", "comment": "",
+                            "confirmed_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+                        }).execute()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save your confirmation: {e}")
+                with st.expander("❌ Something is wrong"):
+                    issue_txt = st.text_area("Tell us what is wrong (items count, service, amount...)", key="pub_issue")
+                    if st.button("Send to store", key="pub_issue_btn"):
+                        if not issue_txt.strip():
+                            st.error("Please write what is wrong.")
+                        else:
+                            try:
+                                supabase.table("bill_confirmations").insert({
+                                    "order_id": bill["order_id"], "status": "Issue", "comment": issue_txt.strip()[:300],
+                                    "confirmed_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+                                }).execute()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not send: {e}")
+
 def build_bill_card_html(b, mobile_display):
     """Professional invoice card (used on screen and in the downloadable bill)."""
     is_paid = float(b["balance"]) <= 0
     badge_bg, badge_fg, badge_txt = ("#DCFCE7", "#166534", "✅ PAID IN FULL") if is_paid else ("#FEF3C7", "#92400E", "⏳ PAYMENT PENDING")
     type_txt = "Doorstep Pickup & Delivery" if b["order_type"] == "Delivery" else "Walk-in"
+    if b.get("corporate"):
+        type_txt = "Corporate Pickup & Delivery"
     rows = [
         ("Service", b["service"]),
         ("Items", f"{int(b['items'])} pcs"),
@@ -423,6 +1070,10 @@ def build_bill_card_html(b, mobile_display):
     if b.get("weight_kg") and float(b["weight_kg"]) > 0:
         rows.append(("Weight", f"{float(b['weight_kg'])} KG"))
     rows += [("Order Type", type_txt), ("Ready By", fmt_date(b["promised_date"]))]
+    if b.get("next_pickup"):
+        rows.append(("Next Pickup", fmt_date(b["next_pickup"])))
+    if b.get("notes"):
+        rows.append(("Notes", html_lib.escape(str(b["notes"]))))
     detail_rows = "".join(
         f'<tr><td style="padding:9px 0;color:#64748B;font-size:0.85rem;border-bottom:1px dashed #E2E8F0;">{k}</td>'
         f'<td style="padding:9px 0;color:#0F172A;font-weight:700;font-size:0.9rem;text-align:right;border-bottom:1px dashed #E2E8F0;">{v}</td></tr>'
@@ -431,8 +1082,14 @@ def build_bill_card_html(b, mobile_display):
     upi_html = "" if is_paid else (
         f'<div style="margin-top:10px;font-size:0.8rem;color:#475569;text-align:center;">Pay via UPI: <b>{STORE_UPI_ID}</b></div>'
     )
+    _uri = logo_data_uri()
+    logo_html = (
+        f'<div style="background:#FFFFFF;text-align:center;padding:16px 10px 8px;"><img src="{_uri}" style="max-height:80px;max-width:75%;"></div>'
+        if _uri else ''
+    )
     return (
         '<div style="max-width:520px;margin:10px auto;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:18px;overflow:hidden;box-shadow:0 10px 30px rgba(15,23,42,0.10);">'
+        f'{logo_html}'
         '<div style="background:linear-gradient(135deg,#2563EB 0%,#1D4ED8 100%);padding:22px;text-align:center;color:#FFFFFF;">'
         f'<div style="font-size:1.3rem;font-weight:800;letter-spacing:0.5px;">💧 {STORE_NAME}</div>'
         f'<div style="font-size:0.8rem;opacity:0.9;margin-top:4px;">{STORE_TAGLINE}</div>'
@@ -481,13 +1138,12 @@ def render_bill_section(bill, key_prefix, mask=False):
 
     wa_msg = build_receipt_message(bill["order_id"], bill["customer_name"], bill["service"], bill["items"],
                                    bill["weight_kg"], bill["total"], bill["paid"], bill["balance"],
-                                   bill["promised_date"], order_type=bill["order_type"])
+                                   bill["promised_date"], order_type=bill["order_type"],
+                                   corporate=bill.get("corporate", False), next_pickup=bill.get("next_pickup"),
+                                   notes=bill.get("notes"))
     wa_url = build_wa_url(bill["mobile"], wa_msg)
     st.markdown(f'<a href="{wa_url}" target="_blank" class="wa-link-btn">📲 Send WhatsApp Receipt</a>', unsafe_allow_html=True)
-    st.download_button("🖨️ Download Bill (Print / Save as PDF)",
-                       data=build_bill_download_html(bill, mob_disp).encode("utf-8"),
-                       file_name=f"{bill['order_id']}_bill.html", mime="text/html",
-                       key=f"{key_prefix}_dl_{bill['order_id']}")
+    bill_download_button(bill, mob_disp, f"{key_prefix}_dl_{bill['order_id']}")
     with st.expander("👁️ Preview WhatsApp Message"):
         st.code(wa_msg, language=None)
 
@@ -669,6 +1325,12 @@ if _fb_order:
     render_feedback_page(str(_fb_order))
     st.stop()
 
+# ==================== PUBLIC BILL PAGE (opened from the WhatsApp bill link) ====================
+_bill_order = st.query_params.get("bill")
+if _bill_order:
+    render_public_bill_page(str(_bill_order), str(st.query_params.get("t", "")))
+    st.stop()
+
 # ==================== LOGIN AUTHENTICATION ====================
 if not st.session_state.logged_in:
     _, lcol, _ = st.columns([1, 1.3, 1])
@@ -783,9 +1445,11 @@ if user_role == "👑 Admin":
         "🏢 Corporate Clients",
         "💰 Delivery Boy Charges",
         "⭐ Customer Feedback",
+        "📞 Call Analytics",
         "👤 Customer Master DB", 
         "💸 Store Expenses Entry", 
         "👥 Staff Salary & Advances",
+        "💾 Data Backup",
         "🔒 Active Device Control", 
         "🎯 Converted Leads"
     ]
@@ -795,7 +1459,6 @@ elif user_role == "👩‍💼 Reception":
         "📊 Operations Dashboard", 
         "🏢 Corporate Clients",
         "📜 Monthly Orders History",
-        "📈 Financial Analytics", 
         "💸 Store Expenses Entry", 
         "🎯 Converted Leads"
     ]
@@ -825,6 +1488,21 @@ if st.sidebar.button("🚪 Logout Session"):
 # --- OPTIMIZED LAZY DATA FETCHING ---
 orders_df = load_data("orders")
 today = datetime.now().date()
+
+# --- AUTO BACKUP: every 5 days the full data is emailed (checked once per login session) ---
+if not st.session_state.get("backup_checked"):
+    st.session_state.backup_checked = True
+    try:
+        _bk = auto_backup_if_due(today)
+        if _bk == "sent":
+            st.toast(f"💾 Auto backup emailed to {BACKUP_EMAIL}")
+        elif _bk == "no_table" and user_role == "👑 Admin":
+            st.warning("⚠️ Auto backup is OFF: create the 'backup_log' table in Supabase (see 💾 Data Backup page).")
+        elif _bk not in ("not_due", "no_table") and user_role == "👑 Admin":
+            st.warning(f"⚠️ {_bk}")
+    except Exception as _e:
+        if user_role == "👑 Admin":
+            st.warning(f"⚠️ Auto backup check failed: {_e}")
 
 # --- PROMISED DATE & MARKETING FOLLOWUP ALERTS ---
 if user_role in ["👑 Admin", "👩‍💼 Reception", "🛵 Delivery Boy"] and not orders_df.empty:
@@ -953,38 +1631,85 @@ elif nav_selection == "🛵 Delivery Portal":
     d_tab1, d_tab2, d_tab3 = st.tabs(["📝 New Doorstep Pickup Billing", "📦 Active Delivery Orders", "⚡ EV Shift Tracking (Start / End Shift)"])
     
     with d_tab1:
-        with st.form("delivery_pickup_form"):
-            dmobile = st.text_input("Customer Mobile Number", placeholder="10-digit number")
-            dcust_name = st.text_input("Customer Name")
-            dservice = st.selectbox("Service Offered", SERVICES_LIST)
-            
+        rk = st.session_state.get("dp_rk", 0)   # changes after every saved order -> clears the form
+        if st.session_state.get("dp_msg"):
+            st.success(st.session_state.pop("dp_msg"))
+
+        cust_kind = st.radio("📌 Pickup From", ["👤 Client", "🏢 Corporate"], horizontal=True, key=f"dp_kind_{rk}")
+        is_corp = cust_kind.startswith("🏢")
+        corp_all = load_data("corporate_clients")
+        corp_active = corp_all[corp_all["status"] == "Active"] if (not corp_all.empty and "status" in corp_all.columns) else pd.DataFrame()
+
+        with st.container(border=True):
+            sel_client = None
+            if is_corp:
+                st.markdown("##### 🏢 Corporate Pickup Details")
+                co_names = corp_active["company_name"].tolist() if not corp_active.empty else []
+                OTHER_CO = "➕ Other Company (type name)"
+                co_choice = st.selectbox("Company Name", co_names + [OTHER_CO], key=f"dp_co_{rk}")
+                if co_choice == OTHER_CO:
+                    dcust_name = st.text_input("Company Name (type here)", key=f"dp_conew_{rk}")
+                    dmobile = st.text_input("Company Contact Mobile", placeholder="10-digit number", key=f"dp_comob_{rk}")
+                else:
+                    sel_client = corp_active[corp_active["company_name"] == co_choice].iloc[0]
+                    dcust_name = co_choice
+                    dmobile = str(sel_client.get("mobile", ""))
+                    st.caption(f"👤 {sel_client.get('contact_person', '')} | 📱 {mask_mobile(dmobile)} | 📍 {sel_client.get('address', '')}")
+            else:
+                st.markdown("##### 👤 Client Details")
+                dmobile = st.text_input("Customer Mobile Number", placeholder="10-digit number", key=f"dp_mob_{rk}")
+                dcust_name = st.text_input("Customer Name", key=f"dp_name_{rk}")
+
+            dchosen = render_service_ticks(f"dp{rk}")
+            dservice = " + ".join(dchosen)
+
             dcol1, dcol2 = st.columns(2)
-            with dcol1: ditems = st.number_input("Items Count", min_value=1, value=1)
-            with dcol2: dweight_kg = st.number_input("Weight (KG)", min_value=0.0, step=0.5, value=0.0)
-            
-            dpromised_date = st.date_input("Promised Delivery Date")
+            with dcol1: ditems = st.number_input("Quantity (Items Count)", min_value=1, value=1, key=f"dp_items_{rk}")
+            with dcol2: dweight_kg = st.number_input("Weight (KG)", min_value=0.0, step=0.5, value=0.0, key=f"dp_wt_{rk}")
+
+            dpromised_date = st.date_input("Promised Delivery Date", key=f"dp_prom_{rk}")
+            dgarment_total, dnotes = render_garment_notes(f"dp{rk}")
+
+            if is_corp:
+                _np_default = next_pickup_date(sel_client, today) if sel_client is not None else today + timedelta(days=2)
+                dnext_pickup = st.date_input("📅 Next Pickup Date", value=_np_default,
+                                             key=f"dp_np_{rk}_{co_choice}")
+            else:
+                dnext_pickup = None
+
             pcol1, pcol2 = st.columns(2)
-            with pcol1: dtotal = st.number_input("Total Amount (₹)", min_value=0.0, step=50.0)
-            with pcol2: dpaid = st.number_input("Paid Amount (₹)", min_value=0.0, step=50.0)
-            
+            with pcol1: dtotal = st.number_input("Total Amount (₹)", min_value=0.0, step=50.0, key=f"dp_total_{rk}")
+            with pcol2: dpaid = st.number_input("Total Amount Paid (₹)" if is_corp else "Paid Amount (₹)", min_value=0.0, step=50.0, key=f"dp_paid_{rk}")
+
             dbal = max(0.0, dtotal - dpaid)
-            st.write(f"**Pending Balance:** ₹{dbal}")
+            st.write(f"**Pending Balance:** ₹{dbal:,.2f}")
 
             dcharge = DELIVERY_CHARGE_PER_ORDER
             st.caption(f"🔒 Delivery charge ₹{DELIVERY_CHARGE_PER_ORDER:,.0f} is auto-recorded for every order. It will NOT appear on the client's bill or WhatsApp message.")
 
-            dsubmit = st.form_submit_button("🚀 Confirm Pickup & Generate Receipt")
-            if dsubmit:
-                if not dmobile or not dcust_name or dtotal <= 0:
-                    st.error("Please enter Mobile, Name, and Total Amount.")
+            dverified = st.checkbox("✅ Customer has checked the details (services, items, notes, amount) and agrees", key=f"dp_verified_{rk}")
+            if st.button("🚀 Confirm Pickup & Generate Receipt", type="primary", key=f"dp_submit_{rk}"):
+                if not str(dcust_name).strip() or len(clean_mobile(dmobile)) < 10:
+                    st.error("Please enter a valid Name and 10-digit Mobile Number.")
+                elif not dchosen:
+                    st.error("Please tick at least one service.")
+                elif dtotal <= 0:
+                    st.error("Please enter the Total Amount.")
+                elif not dverified:
+                    st.error("Please show the details to the customer and tick the verification box.")
                 else:
                     new_id = f"DRY1-2026-{len(orders_df)+1:06d}"
                     curr_month_yr = today.strftime("%B %Y")
-                    
-                    save_record("customers", {
-                        "mobile": str(dmobile), "name": dcust_name, "type": "Delivery",
-                        "total_orders": 1, "total_spent": float(dtotal), "notes": "Created via Delivery Boy Portal"
-                    })
+                    ditems = dgarment_total if dgarment_total > 0 else ditems
+                    if is_corp:
+                        instr = f"Corporate Pickup | Company: {dcust_name} | Next Pickup: {dnext_pickup}"
+                    else:
+                        instr = "Doorstep Pickup"
+                    if dnotes:
+                        instr += f" | Notes: {dnotes}"
+
+                    upsert_customer(dmobile, dcust_name, "Corporate" if is_corp else "Delivery",
+                                    dtotal, "Created via Delivery Boy Portal")
                     save_record("orders", {
                         "order_id": new_id, "customer_name": dcust_name, "mobile": str(dmobile),
                         "customer_type": "Delivery", "service": dservice, "items_count": int(ditems),
@@ -992,17 +1717,34 @@ elif nav_selection == "🛵 Delivery Portal":
                         "balance_amount": float(dbal), "payment_status": "PAID" if dbal == 0 else "PENDING",
                         "order_status": "Order Created", "promised_date": str(dpromised_date),
                         "created_date": str(today), "month_year": curr_month_yr,
-                        "special_instructions": "Doorstep Pickup", "assigned_delivery": "Delivery Boy",
+                        "special_instructions": instr, "assigned_delivery": "Delivery Boy",
                         "delivery_charge": float(dcharge)
                     })
-                    st.success(f"Pickup Order Created: {new_id}")
-                    
+
+                    # Registered corporate client -> also mark today's pickup as done (clears the pickup alert)
+                    if is_corp and sel_client is not None:
+                        _pk_df = load_data("corporate_pickups")
+                        save_record("corporate_pickups", {
+                            "pickup_id": f"PICK-{len(_pk_df)+1:05d}",
+                            "client_id": str(sel_client["client_id"]), "company_name": dcust_name,
+                            "pickup_date": str(today), "status": "Picked Up", "picked_by": user_role,
+                            "picked_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "items_count": int(ditems), "weight_kg": float(dweight_kg),
+                            "extra_charge": float(_num(sel_client.get("pickup_charge"))),
+                            "notes": f"Order {new_id} | {dservice}"
+                        })
+
                     st.session_state.last_bill_delivery = {
                         "order_id": new_id, "customer_name": dcust_name, "mobile": str(dmobile),
                         "service": dservice, "items": int(ditems), "weight_kg": float(dweight_kg),
                         "total": float(dtotal), "paid": float(dpaid), "balance": float(dbal),
-                        "promised_date": str(dpromised_date), "order_type": "Delivery"
+                        "promised_date": str(dpromised_date), "order_type": "Delivery",
+                        "corporate": bool(is_corp), "next_pickup": str(dnext_pickup) if is_corp else None,
+                        "notes": dnotes or None
                     }
+                    st.session_state.dp_msg = f"Pickup Order Created: {new_id}"
+                    st.session_state.dp_rk = rk + 1
+                    st.rerun()
 
         if st.session_state.get("last_bill_delivery"):
             st.markdown("---")
@@ -1037,6 +1779,8 @@ elif nav_selection == "🛵 Delivery Portal":
                             🧼 <b>Service:</b> {drow['service']} ({drow['weight_kg']} KG)<br>
                             💰 <b>Balance Due:</b> ₹{drow['balance_amount']}<br>
                             📅 <b>Promised Date:</b> {drow['promised_date']}
+                            {('<br>🏢 ' + html_lib.escape(str(drow.get('special_instructions')).split(' | Notes:')[0])) if str(drow.get('special_instructions', '')).startswith('Corporate') else ''}
+                            {('<br>📝 ' + html_lib.escape(re.search(r'Notes: (.*)$', str(drow.get('special_instructions'))).group(1))) if re.search(r'Notes: (.*)$', str(drow.get('special_instructions', ''))) else ''}
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1396,11 +2140,13 @@ elif nav_selection == "📝 New Billing & Order":
             cust_name = st.text_input("Customer Name")
             cust_type = st.selectbox("Customer Type", ["Walk-in", "Delivery"])
         with col2:
-            service = st.selectbox("Select Service Offered", SERVICES_LIST)
+            chosen_services = render_service_ticks("bill")
+            service = " + ".join(chosen_services)
             bcol1, bcol2 = st.columns(2)
             with bcol1: items = st.number_input("Items Count", min_value=1, value=1)
             with bcol2: weight_kg = st.number_input("Weight (KG)", min_value=0.0, step=0.5, value=0.0)
             promised_date = st.date_input("Promised Delivery Date")
+            garment_total, order_notes = render_garment_notes("bill")
         
         pcol1, pcol2 = st.columns(2)
         with pcol1: total = st.number_input("Total Amount (₹)", min_value=0.0, step=50.0)
@@ -1413,17 +2159,22 @@ elif nav_selection == "📝 New Billing & Order":
         if cust_type == "Delivery":
             st.caption(f"🔒 Delivery boy charge ₹{DELIVERY_CHARGE_PER_ORDER:,.0f} will be auto-recorded for this order (internal only, NOT shown on client bill).")
 
+        _vk = st.session_state.get("bill_vk", 0)
+        bill_verified = st.checkbox("✅ Customer has checked the details (services, items, notes, amount) and agrees", key=f"bill_verified_{_vk}")
         if st.button("🚀 Confirm Order & Save", type="primary"):
             if not mobile or not cust_name or total <= 0:
                 st.error("Please enter Mobile, Name, and Total Amount.")
+            elif not chosen_services:
+                st.error("Please tick at least one service.")
+            elif not bill_verified:
+                st.error("Please show the details to the customer and tick the verification box.")
             else:
+                st.session_state.bill_vk = _vk + 1
                 new_id = f"DRY1-2026-{len(orders_df)+1:06d}"
                 curr_month_yr = today.strftime("%B %Y")
+                items = garment_total if garment_total > 0 else items
                 
-                save_record("customers", {
-                    "mobile": str(mobile), "name": cust_name, "type": cust_type,
-                    "total_orders": 1, "total_spent": float(total), "notes": ""
-                })
+                upsert_customer(mobile, cust_name, cust_type, total)
                 save_record("orders", {
                     "order_id": new_id, "customer_name": cust_name, "mobile": str(mobile),
                     "customer_type": cust_type, "service": service, "items_count": int(items),
@@ -1431,7 +2182,7 @@ elif nav_selection == "📝 New Billing & Order":
                     "balance_amount": float(bal), "payment_status": "PAID" if bal == 0 else "PENDING",
                     "order_status": "Order Created", "promised_date": str(promised_date),
                     "created_date": str(today), "month_year": curr_month_yr,
-                    "special_instructions": "", "assigned_delivery": "Unassigned",
+                    "special_instructions": (f"Notes: {order_notes}" if order_notes else ""), "assigned_delivery": "Unassigned",
                     "delivery_charge": float(dc_charge)
                 })
                 st.success(f"Order Registered: {new_id}")
@@ -1440,7 +2191,8 @@ elif nav_selection == "📝 New Billing & Order":
                     "order_id": new_id, "customer_name": cust_name, "mobile": str(mobile),
                     "service": service, "items": int(items), "weight_kg": float(weight_kg),
                     "total": float(total), "paid": float(paid), "balance": float(bal),
-                    "promised_date": str(promised_date), "order_type": cust_type
+                    "promised_date": str(promised_date), "order_type": cust_type,
+                    "notes": order_notes or None
                 }
 
     if st.session_state.get("last_bill_billing"):
@@ -1451,40 +2203,49 @@ elif nav_selection == "📝 New Billing & Order":
 elif nav_selection in ["📊 Operations Dashboard", "📊 Master Operations"]:
     st.subheader("📊 Operational Workflow")
     if not orders_df.empty:
-        with st.container(border=True):
-            sel_id = st.selectbox("Select Order ID", orders_df["order_id"].values)
-            target = orders_df[orders_df["order_id"] == sel_id].iloc[0]
+        if user_role == "👑 Admin":
+            st.info("👁️ Admin view only. Order status updates (Ready / Delivered) are handled by Reception.")
+        else:
+            with st.container(border=True):
+                sel_id = st.selectbox("Select Order ID", orders_df["order_id"].values)
+                target = orders_df[orders_df["order_id"] == sel_id].iloc[0]
             
-            cust_mob_disp = target['mobile'] if user_role == "👑 Admin" else mask_mobile(target['mobile'])
-            st.write(f"**Customer:** {target['customer_name']} ({cust_mob_disp}) | **Status:** `{target['order_status']}`")
+                cust_mob_disp = target['mobile'] if user_role == "👑 Admin" else mask_mobile(target['mobile'])
+                st.write(f"**Customer:** {target['customer_name']} ({cust_mob_disp}) | **Status:** `{target['order_status']}`")
             
-            WORKFLOW_STAGES = ["Order Created", "Ready", "Delivered"]
-            curr_idx = WORKFLOW_STAGES.index(target["order_status"]) if target["order_status"] in WORKFLOW_STAGES else 0
+                WORKFLOW_STAGES = ["Order Created", "Ready", "Delivered"]
+                curr_idx = WORKFLOW_STAGES.index(target["order_status"]) if target["order_status"] in WORKFLOW_STAGES else 0
             
-            new_st = st.selectbox("Update Status Stage", WORKFLOW_STAGES, index=curr_idx)
+                new_st = st.selectbox("Update Status Stage", WORKFLOW_STAGES, index=curr_idx)
             
-            if st.button("Update Order Stage", type="primary"):
-                update_record("orders", {"order_status": new_st}, "order_id", sel_id)
-                st.session_state.last_updated_ready_id = sel_id if new_st == "Ready" else None
-                st.session_state.last_delivered_id = sel_id if new_st == "Delivered" else None
-                st.success(f"Order {sel_id} updated to {new_st}!")
-                st.rerun()
+                if st.button("Update Order Stage", type="primary"):
+                    update_record("orders", {"order_status": new_st}, "order_id", sel_id)
+                    st.session_state.last_updated_ready_id = sel_id if new_st == "Ready" else None
+                    st.session_state.last_delivered_id = sel_id if new_st == "Delivered" else None
+                    st.success(f"Order {sel_id} updated to {new_st}!")
+                    st.rerun()
 
-            current_order_status = target["order_status"]
-            # DIRECT WHATSAPP READY NOTIFICATION BUTTON (Auto triggers when stage is Ready)
-            if current_order_status == "Ready" or st.session_state.last_updated_ready_id == sel_id:
-                wa_ready = build_ready_message(sel_id, target['customer_name'], target['service'], target['balance_amount'])
-                wa_ready_url = build_wa_url(target['mobile'], wa_ready)
-                st.markdown(f'<a href="{wa_ready_url}" target="_blank" class="wa-link-btn" style="background:#0284C7 !important;">📲 Send "Garments Ready" WhatsApp Confirmation</a>', unsafe_allow_html=True)
+                current_order_status = target["order_status"]
+                # DIRECT WHATSAPP READY NOTIFICATION BUTTON (Auto triggers when stage is Ready)
+                if current_order_status == "Ready" or st.session_state.last_updated_ready_id == sel_id:
+                    wa_ready = build_ready_message(sel_id, target['customer_name'], target['service'], target['balance_amount'])
+                    wa_ready_url = build_wa_url(target['mobile'], wa_ready)
+                    st.markdown(f'<a href="{wa_ready_url}" target="_blank" class="wa-link-btn" style="background:#0284C7 !important;">📲 Send "Garments Ready" WhatsApp Confirmation</a>', unsafe_allow_html=True)
 
-            # FEEDBACK FORM TO CLIENT AFTER FINAL DELIVERY
-            if current_order_status == "Delivered" or st.session_state.get("last_delivered_id") == sel_id:
-                wa_fb = build_feedback_request_message(sel_id, target['customer_name'])
-                wa_fb_url = build_wa_url(target['mobile'], wa_fb)
-                st.markdown(f'<a href="{wa_fb_url}" target="_blank" class="wa-link-btn" style="background:#7C3AED !important;">⭐ Send Review Request to Client (WhatsApp)</a>', unsafe_allow_html=True)
+                # FEEDBACK FORM TO CLIENT AFTER FINAL DELIVERY
+                if current_order_status == "Delivered" or st.session_state.get("last_delivered_id") == sel_id:
+                    wa_fb = build_feedback_request_message(sel_id, target['customer_name'])
+                    wa_fb_url = build_wa_url(target['mobile'], wa_fb)
+                    st.markdown(f'<a href="{wa_fb_url}" target="_blank" class="wa-link-btn" style="background:#7C3AED !important;">⭐ Send Review Request to Client (WhatsApp)</a>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         disp_df = orders_df.copy()
+        _conf = get_bill_confirmations()
+        if _conf is not None:
+            disp_df["customer_verification"] = disp_df["order_id"].apply(lambda oid: confirmation_label(_conf, oid))
+            _issues = disp_df[disp_df["customer_verification"].astype(str).str.startswith("⚠️")]
+            if not _issues.empty:
+                st.warning(f"⚠️ {len(_issues)} order(s) have a problem reported by the customer: " + ", ".join(_issues["order_id"].astype(str).tolist()))
         if user_role != "👑 Admin":
             disp_df["mobile"] = disp_df["mobile"].apply(mask_mobile)
             disp_df = disp_df.drop(columns=["delivery_charge"], errors="ignore")
@@ -1512,8 +2273,8 @@ elif nav_selection in ["📜 Monthly Orders History", "📜 Orders History & Rep
 
 # ==================== MODULE: FINANCIAL ANALYTICS & GRAPH ====================
 elif nav_selection == "📈 Financial Analytics":
-    if user_role not in ["👑 Admin", "👩‍💼 Reception"]:
-        st.error("🔒 Access Restricted to Admin and Reception Only.")
+    if user_role != "👑 Admin":
+        st.error("🔒 Access Restricted: Profit / Loss & Financial Analytics can only be viewed by Admin.")
     else:
         st.subheader("📈 Financial Analytics & Weekly Performance")
         expenses_df = load_data("expenses")
@@ -1540,6 +2301,265 @@ elif nav_selection == "📈 Financial Analytics":
                 st.bar_chart(weekly_summary)
             else:
                 st.info("No orders in last 7 days to display graph.")
+
+# ==================== MODULE: CALL ANALYTICS (CALLYZER) - ADMIN ONLY ====================
+elif nav_selection == "📞 Call Analytics":
+    if user_role != "👑 Admin":
+        st.error("🔒 Access Restricted to Admin Only.")
+    else:
+        st.markdown(
+            '<div style="background:linear-gradient(135deg,#0F172A 0%,#1E3A8A 55%,#2563EB 100%);border-radius:20px;padding:22px 26px;color:#fff;margin-bottom:16px;'
+            'box-shadow:0 12px 30px rgba(30,58,138,0.30);"><div style="font-size:1.5rem;font-weight:800;">📞 Call Analytics</div>'
+            '<div style="opacity:0.85;font-size:0.9rem;margin-top:4px;">Live call details from Callyzer, matched with your CRM customers</div></div>',
+            unsafe_allow_html=True)
+
+        cz_key = get_app_setting("callyzer_api_key")
+        if cz_key is None:
+            st.error("❌ The 'app_settings' table is missing in Supabase. Run this once in Supabase → SQL Editor, then reload:")
+            st.code("""create table if not exists app_settings (
+  setting_key text primary key,
+  setting_value text
+);
+alter table app_settings disable row level security;""", language="sql")
+        else:
+            cz_env = get_app_setting("callyzer_env", "Production") or "Production"
+            cz_connected = bool(cz_key)
+
+            with st.expander("⚙️ Callyzer Connection (API Key)", expanded=not cz_connected):
+                if cz_connected:
+                    st.success(f"✅ Connected  •  Environment: {cz_env}  •  API key: ••••••••{cz_key[-4:]}")
+                st.caption("Callyzer → Connectors → API & Webhook → API Config → Generate API Access Key. Paste that key below. (API add-on must be active in the client's Callyzer plan.)")
+                new_key = st.text_input("Callyzer API Access Key", type="password", placeholder="Paste the key here", key="cz_new_key")
+                new_env = st.selectbox("Environment", list(CALLYZER_BASES.keys()),
+                                       index=list(CALLYZER_BASES.keys()).index(cz_env) if cz_env in CALLYZER_BASES else 0)
+                cb1, cb2 = st.columns(2)
+                with cb1:
+                    if st.button("🔌 Save & Connect", type="primary"):
+                        if not new_key.strip():
+                            st.error("Please paste the API key.")
+                        else:
+                            _t = datetime.now(IST).date()
+                            with st.spinner("Testing connection with Callyzer..."):
+                                ok, resp = callyzer_post(new_key.strip(), CALLYZER_BASES[new_env], "/call-log/summary", cz_range_body(_t, _t))
+                            if ok:
+                                set_app_setting("callyzer_api_key", new_key.strip())
+                                set_app_setting("callyzer_env", new_env)
+                                cz_fetch_all.clear()
+                                st.success("✅ Callyzer connected successfully!")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Could not connect: {resp}")
+                with cb2:
+                    if cz_connected and st.button("⛔ Disconnect Callyzer"):
+                        set_app_setting("callyzer_api_key", "")
+                        cz_fetch_all.clear()
+                        st.rerun()
+
+            if cz_connected:
+                base_url = CALLYZER_BASES.get(cz_env, CALLYZER_BASES["Production"])
+                ist_today = datetime.now(IST).date()
+
+                pr1, pr2 = st.columns([4, 1])
+                with pr1:
+                    period = st.radio("📅 Period", ["Today", "Yesterday", "Last 7 Days", "This Month", "Custom"], horizontal=True)
+                with pr2:
+                    if st.button("🔄 Refresh"):
+                        cz_fetch_all.clear()
+                        st.rerun()
+
+                if period == "Today":
+                    d1 = d2 = ist_today
+                elif period == "Yesterday":
+                    d1 = d2 = ist_today - timedelta(days=1)
+                elif period == "Last 7 Days":
+                    d1, d2 = ist_today - timedelta(days=6), ist_today
+                elif period == "This Month":
+                    d1, d2 = ist_today.replace(day=1), ist_today
+                else:
+                    cc1, cc2 = st.columns(2)
+                    d1 = cc1.date_input("From", value=ist_today - timedelta(days=6), key="cz_from")
+                    d2 = cc2.date_input("To", value=ist_today, key="cz_to")
+
+                if d1 > d2:
+                    st.error("'From' date must be before 'To' date.")
+                elif (d2 - d1).days > 179:
+                    st.error("Callyzer allows a maximum of 180 days at a time.")
+                else:
+                    with st.spinner("Fetching call data from Callyzer (takes about 10 seconds)..."):
+                        cz = cz_fetch_all(cz_key, base_url, str(d1), str(d2))
+
+                    if cz["fatal"]:
+                        st.error(f"❌ Callyzer error — {cz['errors'][0][1]}")
+                        st.caption("401 = wrong API key • 403 = API add-on / subscription not active • other = check internet and try Refresh.")
+                    else:
+                        sm = cz["summary"]
+                        st.caption(f"Showing: {d1.strftime('%d %b %Y')} → {d2.strftime('%d %b %Y')} (IST)  •  data cached for 5 minutes")
+
+                        total_calls = int(_num(sm.get("total_calls")))
+                        connected_calls = int(_num(sm.get("total_connected_calls")))
+                        rate = f"{(connected_calls / total_calls * 100):.0f}%" if total_calls else "-"
+                        kpis = [
+                            ("📞", "Total Calls", total_calls, "#2563EB", "#1D4ED8"),
+                            ("📥", "Incoming", int(_num(sm.get("total_incoming_calls"))), "#16A34A", "#15803D"),
+                            ("📤", "Outgoing", int(_num(sm.get("total_outgoing_calls"))), "#4F46E5", "#4338CA"),
+                            ("✅", f"Connected ({rate})", connected_calls, "#059669", "#047857"),
+                            ("❌", "Missed", int(_num(sm.get("total_missed_calls"))), "#DC2626", "#B91C1C"),
+                            ("🚫", "Rejected", int(_num(sm.get("total_rejected_calls"))), "#EA580C", "#C2410C"),
+                            ("📵", "Never Attended", int(_num(sm.get("total_never_attended_calls"))), "#E11D48", "#BE123C"),
+                            ("🔕", "Not Picked by Client", int(_num(sm.get("total_not_pickup_by_clients_calls"))), "#D97706", "#B45309"),
+                            ("👥", "Unique Clients", int(_num(sm.get("total_unique_clients"))), "#0D9488", "#0F766E"),
+                            ("⏱️", "Total Talk Time", cz_fmt_secs(sm.get("total_duration")), "#7C3AED", "#6D28D9"),
+                            ("📲", "Incoming Talk Time", cz_fmt_secs(sm.get("total_incoming_duration")), "#0891B2", "#0E7490"),
+                            ("📞", "Outgoing Talk Time", cz_fmt_secs(sm.get("total_outgoing_duration")), "#475569", "#334155"),
+                        ]
+                        st.markdown(
+                            '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:10px 0 18px;">'
+                            + "".join(cz_kpi(*k) for k in kpis) + '</div>', unsafe_allow_html=True)
+
+                        ch1, ch2 = st.columns([3, 2])
+                        with ch1:
+                            st.markdown("##### 📊 Call Type Split")
+                            st.bar_chart(pd.DataFrame({"Calls": [
+                                int(_num(sm.get("total_incoming_calls"))), int(_num(sm.get("total_outgoing_calls"))),
+                                int(_num(sm.get("total_missed_calls"))), int(_num(sm.get("total_rejected_calls")))]},
+                                index=["Incoming", "Outgoing", "Missed", "Rejected"]))
+                        with ch2:
+                            st.markdown("##### 🕘 Working Hours")
+                            st.markdown(
+                                f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:16px;padding:22px;text-align:center;">'
+                                f'<div style="font-size:2rem;font-weight:800;color:#1D4ED8;">{html_lib.escape(str(sm.get("total_working_hours", "-")))}</div>'
+                                f'<div style="color:#64748B;font-size:0.85rem;font-weight:600;">Total working hours (Callyzer)</div></div>',
+                                unsafe_allow_html=True)
+
+                        for _lbl, _err in cz["errors"]:
+                            st.caption(f"⚠️ {_lbl}: {_err}")
+
+                        # ---- CRM match data ----
+                        crm_df = load_data("customers")
+                        crm_map = {}
+                        if not crm_df.empty and "mobile" in crm_df.columns:
+                            for _, cr in crm_df.iterrows():
+                                crm_map[clean_mobile(cr["mobile"])] = cr
+
+                        ct1, ct2, ct3, ct4 = st.tabs(["🕘 Recent Calls", "👥 Staff Performance", "🔔 Follow-ups", "🔗 CRM Match"])
+
+                        # ---------- RECENT CALLS ----------
+                        with ct1:
+                            hist = cz["history"]
+                            if not hist:
+                                st.info("No call details returned for this period (or the call-history endpoint is not available on this plan).")
+                            else:
+                                rows = []
+                                for h in hist:
+                                    num10 = clean_mobile(h.get("client_number", ""))
+                                    cr = crm_map.get(num10)
+                                    rows.append({
+                                        "Date": h.get("call_date", ""), "Time": h.get("call_time", ""),
+                                        "Type": CALL_TYPE_ICON.get(str(h.get("call_type")), str(h.get("call_type", ""))),
+                                        "Client": h.get("client_name") or "-", "Number": num10,
+                                        "Staff": h.get("emp_name", "-"), "Duration": cz_fmt_secs(h.get("duration")),
+                                        "CRM Customer": (str(cr["name"]) if cr is not None else "— new number —"),
+                                        "CRM Orders": (int(_num(cr.get("total_orders"))) if cr is not None else 0),
+                                        "Note": h.get("note") or "",
+                                    })
+                                hdf = pd.DataFrame(rows)
+                                f1, f2 = st.columns([2, 3])
+                                with f1:
+                                    type_pick = st.multiselect("Call Type", list(CALL_TYPE_ICON.values()), default=[])
+                                with f2:
+                                    q = st.text_input("🔍 Search name / number", placeholder="e.g. 98765 or Kavin")
+                                if type_pick:
+                                    hdf = hdf[hdf["Type"].isin(type_pick)]
+                                if q.strip():
+                                    ql = q.strip().lower()
+                                    hdf = hdf[hdf.apply(lambda r: ql in " ".join(map(str, r.values)).lower(), axis=1)]
+                                st.dataframe(hdf, use_container_width=True, hide_index=True, height=430)
+                                st.caption(f"Showing latest {len(hdf)} of {len(hist)} calls fetched.")
+
+                        # ---------- STAFF PERFORMANCE ----------
+                        with ct2:
+                            emps = cz["employees"]
+                            if not emps:
+                                st.info("No staff report returned for this period.")
+                            else:
+                                erows = []
+                                for e in emps:
+                                    tc = int(_num(e.get("total_calls")))
+                                    cc = int(_num(e.get("total_connected_calls")))
+                                    erows.append({
+                                        "Staff": e.get("emp_name", "-"), "Number": e.get("emp_number", ""),
+                                        "Total": tc, "Incoming": int(_num(e.get("total_incoming_calls"))),
+                                        "Outgoing": int(_num(e.get("total_outgoing_calls"))),
+                                        "Missed": int(_num(e.get("total_missed_calls"))), "Connected": cc,
+                                        "Connect %": round(cc / tc * 100, 0) if tc else 0.0,
+                                        "Talk Time": cz_fmt_secs(e.get("total_duration")),
+                                        "Unique Clients": int(_num(e.get("total_unique_clients"))),
+                                        "Working Hours": e.get("total_working_hours", "-"),
+                                    })
+                                edf = pd.DataFrame(erows).sort_values("Total", ascending=False)
+                                st.dataframe(edf, use_container_width=True, hide_index=True,
+                                             column_config={"Connect %": st.column_config.ProgressColumn("Connect %", min_value=0, max_value=100, format="%d%%")})
+                                st.bar_chart(edf.set_index("Staff")[["Incoming", "Outgoing", "Missed"]])
+
+                        # ---------- FOLLOW-UPS ----------
+                        with ct3:
+                            def _fu_rows(items):
+                                out = []
+                                for it in items:
+                                    logs = it.get("call_logs") or []
+                                    last = logs[-1] if logs else {}
+                                    cn = cz_client_number(it)
+                                    out.append((it.get("client_name") or clean_mobile(cn), cn,
+                                                f"{last.get('call_date', '')} {last.get('call_time', '')}".strip(),
+                                                it.get("emp_name", "-")))
+                                return out
+                            st.markdown("##### ❌ Missed calls — nobody called back")
+                            nv = _fu_rows(cz["never"])
+                            if not nv:
+                                st.success("🎉 No pending missed calls!")
+                            for nm, num, when, staff in nv[:30]:
+                                cr = crm_map.get(clean_mobile(num))
+                                st.markdown(cz_followup_card(str(cr["name"]) if cr is not None else nm, num, when, staff, "#DC2626"), unsafe_allow_html=True)
+                            st.markdown("##### 🔕 We called — client did not pick up")
+                            npk = _fu_rows(cz["notpick"])
+                            if not npk:
+                                st.success("✅ Nothing pending here.")
+                            for nm, num, when, staff in npk[:30]:
+                                cr = crm_map.get(clean_mobile(num))
+                                st.markdown(cz_followup_card(str(cr["name"]) if cr is not None else nm, num, when, staff, "#D97706"), unsafe_allow_html=True)
+
+                        # ---------- CRM MATCH ----------
+                        with ct4:
+                            hist = cz["history"]
+                            if not hist:
+                                st.info("Call details are needed for CRM matching.")
+                            else:
+                                known = set()
+                                unknown = {}
+                                for h in hist:
+                                    n10 = clean_mobile(h.get("client_number", ""))
+                                    if not n10:
+                                        continue
+                                    if n10 in crm_map:
+                                        known.add(n10)
+                                    else:
+                                        unknown[n10] = h.get("client_name") or ""
+                                k1, k2 = st.columns(2)
+                                k1.metric("Callers already in CRM", len(known))
+                                k2.metric("New / unknown numbers", len(unknown))
+                                if unknown:
+                                    st.markdown("##### ➕ Add unknown caller as a Marketing Lead")
+                                    pick = st.selectbox("Unknown number", list(unknown.keys()),
+                                                        format_func=lambda n: f"{n}  {('(' + unknown[n] + ')') if unknown[n] else ''}")
+                                    lname = st.text_input("Lead Name", value=unknown.get(pick, ""), key=f"cz_ln_{pick}")
+                                    if st.button("🎯 Add as Lead (follow-up today)"):
+                                        _ld = load_data("marketing_leads")
+                                        if save_record("marketing_leads", {
+                                            "lead_id": f"LEAD-{len(_ld)+1:04d}", "customer_name": lname.strip() or pick,
+                                            "mobile": pick, "followup_date": str(today),
+                                            "status": "Pending Followup", "notes": "Added from Callyzer call log"
+                                        }):
+                                            st.success("Lead added! It will show in Marketing follow-ups.")
 
 # ==================== MODULE: CUSTOMER MASTER DB ====================
 elif nav_selection == "👤 Customer Master DB":
@@ -1742,6 +2762,59 @@ elif nav_selection == "👥 Staff Salary & Advances":
             else:
                 st.dataframe(pay_df[["month", "staff_name", "gross_salary", "advance_deducted", "net_paid", "paid_date"]].sort_values("month", ascending=False),
                              use_container_width=True, hide_index=True)
+
+# ==================== MODULE: DATA BACKUP (ADMIN ONLY) ====================
+elif nav_selection == "💾 Data Backup":
+    if user_role != "👑 Admin":
+        st.error("🔒 Access Restricted to Admin Only.")
+    else:
+        st.subheader("💾 Data Backup")
+        st.caption(f"Every {BACKUP_INTERVAL_DAYS} days all data is automatically emailed to {BACKUP_EMAIL} as a ZIP of CSV files (checked whenever the app is opened).")
+        bk_log = get_backup_log()
+        if bk_log is None:
+            st.error("❌ The 'backup_log' table is missing in Supabase, so auto backup is OFF. Run this once in Supabase → SQL Editor:")
+            st.code("""create table if not exists backup_log (
+  id bigint generated always as identity primary key,
+  backup_date text,
+  status text,
+  trigger_type text,
+  tables_count int,
+  rows_count int,
+  created_at text
+);
+alter table backup_log disable row level security;""", language="sql")
+        else:
+            _last = last_backup_date(bk_log)
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Last Backup", fmt_date(_last) if _last else "Never")
+            _next = (_last + timedelta(days=BACKUP_INTERVAL_DAYS)) if _last else today
+            b2.metric("Next Auto Backup", "Due now (on next app open)" if _next <= today else fmt_date(_next))
+            b3.metric("Backups Sent", int(len(bk_log)))
+
+            st.markdown("#### Manual Backup")
+            m1, m2 = st.columns(2)
+            with m1:
+                if st.button("📧 Send Backup Email Now", type="primary"):
+                    with st.spinner("Preparing backup and sending email..."):
+                        ok, msg, zbytes = run_backup(today, "Manual")
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+            with m2:
+                if st.button("📦 Prepare ZIP to Download"):
+                    with st.spinner("Preparing ZIP..."):
+                        st.session_state.backup_zip, _s = build_backup_zip()
+                if st.session_state.get("backup_zip"):
+                    st.download_button("⬇️ Download Backup ZIP", data=st.session_state.backup_zip,
+                                       file_name=f"Dry1_Backup_{today}.zip", mime="application/zip")
+
+            st.markdown("#### Backup History")
+            if bk_log.empty:
+                st.info("No backups sent yet.")
+            else:
+                st.dataframe(bk_log.sort_values("backup_date", ascending=False), use_container_width=True, hide_index=True)
 
 # ==================== MODULE: ACTIVE DEVICE CONTROL ====================
 elif nav_selection == "🔒 Active Device Control":
