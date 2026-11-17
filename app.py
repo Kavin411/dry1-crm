@@ -474,6 +474,11 @@ def build_receipt_message(order_id, customer_name, service, items, weight_kg,
         lines += [f"Pay via UPI: *{STORE_UPI_ID}*"]
     lines += [
         "",
+        "📄 *Download your bill (PDF):*",
+        build_bill_link(order_id),
+    ]
+    lines += [
+        "",
         WA_LINE,
         "_Please keep this receipt for order collection._",
         f"📞 Support: {STORE_CONTACT}",
@@ -1031,42 +1036,6 @@ def render_public_bill_page(order_id, token):
         st.markdown(build_bill_card_html(bill, mob), unsafe_allow_html=True)
         st.caption(f"📦 Order Status: {row.get('order_status', '')}")
         bill_download_button(bill, mob, "public_bill_dl")
-
-        # ---- customer verification ----
-        conf_df = get_bill_confirmations()
-        if conf_df is not None:
-            st.markdown("---")
-            lc = latest_confirmation(conf_df, bill["order_id"])
-            if lc and lc[0] == "Confirmed":
-                st.success(f"✅ You confirmed this bill on {lc[2]}. Thank you!")
-            else:
-                if lc and lc[0] == "Issue":
-                    st.warning("⚠️ You reported a problem with this bill. Our team will contact you shortly.")
-                st.markdown("##### Is everything correct?")
-                st.caption("Please check the services, items, notes and amount above.")
-                if st.button("✅ Yes, everything is correct", type="primary", key="pub_confirm"):
-                    try:
-                        supabase.table("bill_confirmations").insert({
-                            "order_id": bill["order_id"], "status": "Confirmed", "comment": "",
-                            "confirmed_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M")
-                        }).execute()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save your confirmation: {e}")
-                with st.expander("❌ Something is wrong"):
-                    issue_txt = st.text_area("Tell us what is wrong (items count, service, amount...)", key="pub_issue")
-                    if st.button("Send to store", key="pub_issue_btn"):
-                        if not issue_txt.strip():
-                            st.error("Please write what is wrong.")
-                        else:
-                            try:
-                                supabase.table("bill_confirmations").insert({
-                                    "order_id": bill["order_id"], "status": "Issue", "comment": issue_txt.strip()[:300],
-                                    "confirmed_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M")
-                                }).execute()
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Could not send: {e}")
 
 def build_bill_card_html(b, mobile_display):
     """Professional invoice card (used on screen and in the downloadable bill)."""
@@ -2252,12 +2221,6 @@ elif nav_selection in ["📊 Operations Dashboard", "📊 Master Operations"]:
 
         st.markdown("<br>", unsafe_allow_html=True)
         disp_df = orders_df.copy()
-        _conf = get_bill_confirmations()
-        if _conf is not None:
-            disp_df["customer_verification"] = disp_df["order_id"].apply(lambda oid: confirmation_label(_conf, oid))
-            _issues = disp_df[disp_df["customer_verification"].astype(str).str.startswith("⚠️")]
-            if not _issues.empty:
-                st.warning(f"⚠️ {len(_issues)} order(s) have a problem reported by the customer: " + ", ".join(_issues["order_id"].astype(str).tolist()))
         if user_role != "👑 Admin":
             disp_df["mobile"] = disp_df["mobile"].apply(mask_mobile)
             disp_df = disp_df.drop(columns=["delivery_charge"], errors="ignore")
