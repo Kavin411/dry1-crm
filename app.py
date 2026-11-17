@@ -409,6 +409,16 @@ def bill_token(order_id):
 def build_bill_link(order_id):
     return f"{_link_base()}/?bill={urllib.parse.quote(str(order_id))}&t={bill_token(order_id)}"
 
+def split_order_notes(notes):
+    """'Shirt x3, Pant x2 | stain on collar' -> ([('Shirt', 3), ('Pant', 2)], 'stain on collar')."""
+    if not notes:
+        return [], ""
+    first, _, rest = str(notes).partition(" | ")
+    if re.fullmatch(r"\s*[A-Za-z][A-Za-z /\-]*? x\d+(?:,\s*[A-Za-z][A-Za-z /\-]*? x\d+)*\s*", first):
+        garments = [(n.strip(), int(q)) for n, q in re.findall(r"([A-Za-z][A-Za-z /\-]*?) x(\d+)", first)]
+        return garments, rest.strip()
+    return [], str(notes).strip()
+
 def build_receipt_message(order_id, customer_name, service, items, weight_kg,
                           total, paid, balance, promised_date, order_type="Walk-in",
                           corporate=False, next_pickup=None, notes=None):
@@ -431,8 +441,7 @@ def build_receipt_message(order_id, customer_name, service, items, weight_kg,
     details.append(f"Ready By : {fmt_date(promised_date)}")
     if next_pickup:
         details.append(f"Next Pickup : {fmt_date(next_pickup)}")
-    if notes:
-        details.append(f"Notes    : {notes}")
+    garments, extra_note = split_order_notes(notes)
 
     payment = [
         f"Total Amount : ₹{total:,.2f}",
@@ -447,6 +456,14 @@ def build_receipt_message(order_id, customer_name, service, items, weight_kg,
         "",
         "📋 *ORDER DETAILS*",
         "```" + "\n".join(details) + "```",
+    ]
+    if garments or extra_note:
+        lines += ["", "👗 *DRESS DETAILS*"]
+        if garments:
+            lines += ["```" + "\n".join(f"{n} x {q}" for n, q in garments) + f"\nTotal : {sum(q for _, q in garments)} pcs```"]
+        if extra_note:
+            lines += [f"📝 Note: {extra_note}"]
+    lines += [
         "",
         "💳 *PAYMENT SUMMARY*",
         "```" + "\n".join(payment) + "```",
@@ -455,11 +472,6 @@ def build_receipt_message(order_id, customer_name, service, items, weight_kg,
     ]
     if not is_paid:
         lines += [f"Pay via UPI: *{STORE_UPI_ID}*"]
-    lines += [
-        "",
-        "🔗 *Check your bill, confirm & download PDF:*",
-        build_bill_link(order_id),
-    ]
     lines += [
         "",
         WA_LINE,
